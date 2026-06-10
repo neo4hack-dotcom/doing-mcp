@@ -14,10 +14,12 @@ from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
+import chat as chat_mod
 import codegen
 import connectors
 import guardrails
 import llm as llm_mod
+import mcp_client
 import runner
 import storage
 
@@ -31,6 +33,11 @@ app.add_middleware(
 
 @app.exception_handler(llm_mod.LlmError)
 async def llm_error_handler(_request, exc: llm_mod.LlmError):
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
+@app.exception_handler(mcp_client.McpClientError)
+async def mcp_error_handler(_request, exc: mcp_client.McpClientError):
     return JSONResponse(status_code=502, content={"detail": str(exc)})
 
 
@@ -765,6 +772,37 @@ def project_status(project_id: str):
 @app.get("/api/projects/{project_id}/logs", response_class=PlainTextResponse)
 def project_logs(project_id: str, tail: int = 200):
     return runner.logs(project_id, tail)
+
+
+@app.post("/api/projects/{project_id}/chat")
+def project_chat(project_id: str, payload: dict = Body(...)):
+    """Integrated chat: the local LLM calls this project's running MCP server.
+
+    The server is auto-started locally (HTTP) if needed. Fully local — only the
+    configured local LLM and the 127.0.0.1 MCP server are contacted.
+    """
+    db = storage.load()
+    project = storage.find(db["projects"], project_id)
+    if not project:
+        raise HTTPException(404, "Project not found.")
+    enabled = [t for t in db["tools"] if t["id"] in project["tool_ids"] and t.get("enabled", True)]
+    if not enabled:
+        raise HTTPException(400, "This project has no enabled tool — add one before chatting.")
+
+    status = runner.status(project_id)
+    started = False
+    if not status.get("running"):
+        files = codegen.generate_project_files(db, project)
+        status = runner.start(db, project, files)
+        started = True
+        if not status.get("running"):
+            raise HTTPException(400, "Could not start the MCP server — check the logs in the Projects tab.")
+
+    url = status.get("url") or f"http://127.0.0.1:{project.get('port') or 8900}/mcp"
+    messages = payload.get("messages") or []
+    result = chat_mod.run_chat(db["settings"]["llm"], url, messages)
+    result["server"] = {"running": True, "url": url, "port": status.get("port"), "auto_started": started}
+    return {"result": result}
 
 
 # ---------------------------------------------------------------- Audit

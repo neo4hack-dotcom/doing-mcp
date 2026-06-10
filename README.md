@@ -49,7 +49,15 @@ connection test, model listing, temperature.
 4. **Guardrails** — deterministic validation + LLM security review + suggested PII masking.
 5. **Tool** — MCP contract (name, description, typed parameters) suggested by the AI, confirmed by you.
 6. **Project** — drag the tool into an existing server or create a new one.
-7. **Shipping** — FastMCP code generated, downloadable ZIP, one-click local run, ready-to-paste Claude Desktop config.
+7. **Shipping** — FastMCP code generated, downloadable ZIP, one-click local run, ready-to-paste Claude Desktop config, and an **integrated chat** to test the server with your local LLM.
+
+## Integrated chat (local LLM × MCP)
+
+Every MCP project ships with a built-in chat (Projects tab → **Chat**, and the final Pipeline step → **Test in chat**).
+Ask a question in plain language: DOINg.MCP **auto-starts the generated server locally**, the local LLM
+discovers its tools over the real MCP protocol, **calls them** (tool calls are shown inline), and answers with
+**live data from your database**. Nothing leaves your machine — only the local LLM and the `127.0.0.1` MCP server
+are contacted. The LLM must support OpenAI tool/function calling (most do via Ollama, LM Studio, vLLM).
 
 ## Features (beyond the brief)
 
