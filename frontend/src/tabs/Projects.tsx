@@ -1,12 +1,13 @@
 // MCP Projects tab: compose a server by dragging tools in, generate the FastMCP code,
 // export it as a ZIP, run it locally (HTTP) and follow its logs.
 import {
-  ArrowDown, ArrowUp, Boxes, Download, FileCode2, FileJson, Play, Plus,
+  ArrowDown, ArrowUp, Boxes, Download, FileCode2, FileJson, MessageSquare, Play, Plus,
   ScrollText, Square, Trash2, Upload, X,
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DragEvent } from 'react'
 import { api } from '../api'
+import ProjectChat from '../components/ProjectChat'
 import {
   Badge, Button, Card, CodeBlock, EmptyState, Field, Input, Modal, Select,
   Textarea, cls, useBusy, useConfirm, useToast,
@@ -23,6 +24,7 @@ export default function Projects({ db, apply, goTo }: TabProps) {
   const [files, setFiles] = useState<Record<string, string> | null>(null)
   const [activeFile, setActiveFile] = useState('server.py')
   const [logs, setLogs] = useState<string | null>(null)
+  const [chatOpen, setChatOpen] = useState(false)
   const [status, setStatus] = useState<RunnerStatus | null>(null)
   const [dragOver, setDragOver] = useState(false)
   const [busy, run] = useBusy()
@@ -198,6 +200,7 @@ export default function Projects({ db, apply, goTo }: TabProps) {
                 subtitle={<span className="font-mono">{project.slug} · v{project.version}</span>}
                 actions={
                   <div className="flex flex-wrap gap-1.5">
+                    <Button size="sm" icon={MessageSquare} onClick={() => setChatOpen(true)} disabled={project.tool_ids.length === 0}>Chat</Button>
                     <Button size="sm" variant="outline" icon={FileCode2} busy={busy === 'generate'} onClick={generate}>View code</Button>
                     <a href={api.exportUrl(project.id)} download>
                       <Button size="sm" variant="outline" icon={Download}>ZIP</Button>
@@ -354,6 +357,16 @@ export default function Projects({ db, apply, goTo }: TabProps) {
       {/* ----- Logs modal ----- */}
       <Modal open={logs !== null} onClose={() => setLogs(null)} title="Server logs" wide>
         <CodeBlock code={logs ?? ''} filename="server.log" maxHeight="max-h-[60vh]" />
+      </Modal>
+
+      {/* ----- Chat modal ----- */}
+      <Modal
+        open={chatOpen && project !== null}
+        onClose={() => setChatOpen(false)}
+        title={<span>Chat with <span className="font-mono text-brand-600 dark:text-brand-400">{project?.slug}</span> — local LLM × MCP</span>}
+        wide
+      >
+        {project && <ProjectChat project={project} db={db} />}
       </Modal>
     </div>
   )

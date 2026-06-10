@@ -187,6 +187,26 @@ export interface Envelope<T = unknown> {
   result: T
 }
 
+export interface ChatStep {
+  tool: string
+  args: Record<string, unknown>
+  ok: boolean
+  result: string
+}
+
+export interface ChatResult {
+  reply: string
+  steps: ChatStep[]
+  tools_available: string[]
+  server?: { running: boolean; url: string; port?: number; auto_started?: boolean }
+}
+
+export interface ChatTurn {
+  role: 'user' | 'assistant'
+  content: string
+  steps?: ChatStep[]
+}
+
 export interface RunnerStatus {
   running: boolean
   pid?: number

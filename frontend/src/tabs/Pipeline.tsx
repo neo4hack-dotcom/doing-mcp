@@ -2,14 +2,15 @@
 // all the way to a shipped MCP server. Assisted selection, drag & drop, confirmations.
 import {
   ArrowLeft, ArrowRight, Check, Database, Download, FlaskConical, Hammer,
-  Package, Play, Rocket, ShieldCheck, Sparkles, SquareTerminal, Table2, X,
+  MessageSquare, Package, Play, Rocket, ShieldCheck, Sparkles, SquareTerminal, Table2, X,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import type { DragEvent } from 'react'
 import { api } from '../api'
 import { GuardrailPanel, ParamInputs, ResultsTable, RiskBadge } from '../components/data'
+import ProjectChat from '../components/ProjectChat'
 import {
-  Badge, Button, Card, CodeBlock, Field, Input, Select, Textarea, cls,
+  Badge, Button, Card, CodeBlock, Field, Input, Modal, Select, Textarea, cls,
   useBusy, useToast,
 } from '../components/ui'
 import type {
@@ -52,6 +53,7 @@ export default function Pipeline({ db, apply, goTo }: TabProps) {
   const [projectId, setProjectId] = useState<string>('')
   const [newProjectName, setNewProjectName] = useState('')
   const [files, setFiles] = useState<Record<string, string> | null>(null)
+  const [chatOpen, setChatOpen] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const [busy, run] = useBusy()
   const toast = useToast()
@@ -505,7 +507,8 @@ export default function Pipeline({ db, apply, goTo }: TabProps) {
             subtitle="Generate the standalone FastMCP server, export and test in one click."
             actions={
               <div className="flex gap-1.5">
-                <Button size="sm" icon={Sparkles} busy={busy === 'ship'} onClick={ship}>Generate the code</Button>
+                <Button size="sm" icon={MessageSquare} onClick={() => setChatOpen(true)}>Test in chat</Button>
+                <Button size="sm" variant="outline" icon={Sparkles} busy={busy === 'ship'} onClick={ship}>Generate the code</Button>
                 <a href={api.exportUrl(project.id)} download>
                   <Button size="sm" variant="outline" icon={Download}>Download the ZIP</Button>
                 </a>
@@ -549,6 +552,16 @@ export default function Pipeline({ db, apply, goTo }: TabProps) {
           <Button variant="outline" icon={Check} onClick={() => goTo('projects')}>Finish → Projects</Button>
         )}
       </div>
+
+      {/* Integrated chat — test the shipped server with the local LLM */}
+      <Modal
+        open={chatOpen && Boolean(project)}
+        onClose={() => setChatOpen(false)}
+        title={<span>Chat with <span className="font-mono text-brand-600 dark:text-brand-400">{project?.slug}</span> — local LLM × MCP</span>}
+        wide
+      >
+        {project && <ProjectChat project={project} db={db} />}
+      </Modal>
     </div>
   )
 }

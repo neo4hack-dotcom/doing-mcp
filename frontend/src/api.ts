@@ -1,6 +1,6 @@
 // DOINg.MCP — API client: X-Base-Version optimistic versioning, typed errors.
 import type {
-  Envelope, LlmTestResult, RunOutcome, RunnerStatus, SecurityReview,
+  ChatResult, Envelope, LlmTestResult, RunOutcome, RunnerStatus, SecurityReview,
   SqlSuggestion, ToolSuggestion, Validation,
 } from './types'
 
@@ -114,6 +114,8 @@ export const api = {
   runProject: (id: string) => http<Env<RunnerStatus>>('POST', `/api/projects/${id}/run`),
   stopProject: (id: string) => http<Env<RunnerStatus>>('POST', `/api/projects/${id}/stop`),
   projectStatus: (id: string) => http<{ result: RunnerStatus }>('GET', `/api/projects/${id}/status`),
+  projectChat: (id: string, messages: { role: string; content: string }[]) =>
+    http<{ result: ChatResult }>('POST', `/api/projects/${id}/chat`, { messages }),
   projectBundle: (id: string) => http<Record<string, unknown>>('GET', `/api/projects/${id}/bundle`),
   projectLogs: async (id: string): Promise<string> => {
     const res = await fetch(`/api/projects/${id}/logs?tail=300`)

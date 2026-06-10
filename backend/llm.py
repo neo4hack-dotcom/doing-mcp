@@ -73,6 +73,38 @@ def chat(llm: dict, messages: list[dict], temperature: float | None = None,
         raise LlmError(f"Unexpected LLM response: {exc}") from exc
 
 
+def chat_with_tools(llm: dict, messages: list[dict], tools: list[dict],
+                    temperature: float | None = None, max_tokens: int | None = None) -> dict:
+    """Tool-calling turn: returns the full assistant message dict (may contain tool_calls)."""
+    payload: dict = {
+        "model": llm.get("model") or "default",
+        "messages": messages,
+        "temperature": llm.get("temperature", 0.2) if temperature is None else temperature,
+        "max_tokens": max_tokens or int(llm.get("max_tokens") or 2048),
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    try:
+        resp = httpx.post(_base(llm) + "/chat/completions", json=payload,
+                          headers=_headers(llm), timeout=240)
+        resp.raise_for_status()
+        message = resp.json()["choices"][0]["message"]
+        if not isinstance(message, dict):
+            raise LlmError("Unexpected LLM message shape.")
+        return message
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:300]
+        if exc.response.status_code in (400, 404, 422):
+            raise LlmError("This local model rejected tool-calling. Pick a model that supports "
+                           f"OpenAI tools/function-calling. Server said: {detail}") from exc
+        raise LlmError(f"LLM HTTP {exc.response.status_code}: {detail}") from exc
+    except httpx.HTTPError as exc:
+        raise LlmError(f"LLM unreachable ({_base(llm)}): {exc}") from exc
+    except (KeyError, IndexError, ValueError) as exc:
+        raise LlmError(f"Unexpected LLM response: {exc}") from exc
+
+
 def parse_json_loose(text: str):
     """Tolerant parse: strip markdown fences, isolate the first JSON object/array."""
     cleaned = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text.strip(), flags=re.MULTILINE).strip()
