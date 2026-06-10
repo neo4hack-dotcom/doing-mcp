@@ -7,7 +7,9 @@ export default defineConfig({
     port: 3000,
     host: true,
     proxy: {
-      '/api': 'http://localhost:3001',
+      // 127.0.0.1 (not "localhost") so the Node proxy never depends on DNS
+      // resolution of the hostname — avoids `getaddrinfo ENOTFOUND localhost`.
+      '/api': 'http://127.0.0.1:3001',
     },
   },
 })
