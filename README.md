@@ -49,7 +49,7 @@ connection test, model listing, temperature.
 4. **Guardrails** — deterministic validation + LLM security review + suggested PII masking.
 5. **Tool** — MCP contract (name, description, typed parameters) suggested by the AI, confirmed by you.
 6. **Project** — drag the tool into an existing server or create a new one.
-7. **Shipping** — FastMCP code generated, downloadable ZIP, one-click local run, ready-to-paste Claude Desktop config, and an **integrated chat** to test the server with your local LLM.
+7. **Shipping** — FastMCP code generated, downloadable ZIP, one-click local run, ready-to-paste MCP client config, and an **integrated chat** to test the server with your local LLM.
 
 ## Integrated chat (local LLM × MCP)
 
@@ -72,7 +72,7 @@ are contacted. The LLM must support OpenAI tool/function calling (most do via Ol
 9. **Tool contract suggestion** by the AI (snake_case name, agent-friendly description, typed/documented parameters).
 10. **Tool test playground** (form generated from the parameters, live results).
 11. **Per-tool rate-limiting** (calls/minute) compiled into the generated server.
-12. **Full ZIP export**: `server.py`, `requirements.txt`, `README.md`, `.env.example`, `catalog.json`, `manifest.json`, Claude Desktop config.
+12. **Full ZIP export**: `server.py`, `requirements.txt`, `README.md`, `.env.example`, `catalog.json`, `manifest.json`, generic MCP client config.
 13. **Built-in runner**: local HTTP launch of the generated server, status (PID/port), logs, stop — from the UI.
 14. **Zero secrets in the generated code**: credentials via environment variables only, passwords never returned by the API.
 15. **Optimistic concurrency**: `X-Base-Version` header, HTTP 409 + automatic resync on conflict across tabs.
@@ -83,6 +83,21 @@ are contacted. The LLM must support OpenAI tool/function calling (most do via Ol
 20. **Dark/light mode** persisted, system fonts, 100% offline (no CDN).
 21. **Saved queries** with last run status and result sample (reused as AI context).
 22. **Drag & drop everywhere**: tables → SQL editor, tables → pipeline selection, tools → projects (with reordering).
+23. **Row-level security per tool**: fully parameterizable visibility rules — capture a caller identity (e.g. `user_id`) and declare “this caller can see these values of column A and/or B”. Fail-closed by default, enforced in the app **and compiled into the generated server** (bound parameters, subquery wrapping).
+24. **Column profiling** (Explorer): row count, null rates, cardinality, min/max and top values per column — ideal for choosing RLS columns and rule values.
+25. **Join-key detection** (Explorer): probable relationships between tables inferred from column names (`orders.customer_id → customers.id`, shared keys), with one-click navigation.
+26. **Starter tools**: one click generates deterministic tools for a table (list / get_by_id / count_by / search) — an MCP server in seconds, no LLM needed.
+27. **Magic tool**: describe the tool in plain language — the local LLM writes the SQL, validates it against the guardrails (with one auto-repair attempt), names it, documents the contract and creates it.
+28. **Project preflight**: a pre-ship checklist — guardrails per tool, contract/SQL parameter coherence, RLS policy sanity, live connection tests — with pass/warn/fail verdicts.
+
+## Row-level security (RLS)
+
+Each tool can carry a *row policy*: an *identity argument* (default `user_id`) is added to the
+tool contract, and rules of the form **“these callers → these values of this column”** filter
+every result. Rules on the same column add up (OR); different columns combine (AND); callers
+matching no rule see nothing by default (fail-closed, configurable). Enforcement wraps the
+tool's SQL as a subquery with bound parameters — no string interpolation — and the exact same
+policy is **compiled into the generated `server.py`**, so MCP clients cannot bypass it.
 
 ## Architecture
 

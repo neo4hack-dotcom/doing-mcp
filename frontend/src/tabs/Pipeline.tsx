@@ -519,7 +519,7 @@ export default function Pipeline({ db, apply, goTo }: TabProps) {
             <p className="text-xs text-zinc-500">
               The bundle contains: <span className="font-mono">server.py</span> (FastMCP, embedded guardrails),{' '}
               <span className="font-mono">requirements.txt</span>, <span className="font-mono">README.md</span>,{' '}
-              <span className="font-mono">.env.example</span>, the JSON catalog and the Claude Desktop config.
+              <span className="font-mono">.env.example</span>, the JSON catalog and a generic MCP client config.
               Fine-grained management afterwards in the <button className="underline" onClick={() => goTo('projects')}>Projects</button> tab.
             </p>
           </Card>
@@ -529,8 +529,8 @@ export default function Pipeline({ db, apply, goTo }: TabProps) {
             </Card>
           )}
           {files && (
-            <Card title="Connect to Claude Desktop">
-              <CodeBlock code={files['claude_desktop_config.example.json'] ?? ''} filename="claude_desktop_config.json" maxHeight="max-h-40" />
+            <Card title="Connect to an MCP client">
+              <CodeBlock code={files['mcp_client_config.example.json'] ?? ''} filename="mcp_client_config.json" maxHeight="max-h-40" />
             </Card>
           )}
         </div>

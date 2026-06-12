@@ -1,7 +1,7 @@
 // DOINg.MCP — API client: X-Base-Version optimistic versioning, typed errors.
 import type {
-  ChatResult, Envelope, LlmTestResult, RunOutcome, RunnerStatus, SecurityReview,
-  SqlSuggestion, ToolSuggestion, Validation,
+  ChatResult, Envelope, LlmTestResult, MagicResult, PreflightReport, RunOutcome,
+  RunnerStatus, SecurityReview, SqlSuggestion, TableProfile, ToolSuggestion, Validation,
 } from './types'
 
 export class ApiError extends Error {
@@ -89,6 +89,9 @@ export const api = {
     http<Env<{ enriched: number }>>('POST', `/api/connections/${id}/enrich`, { table_keys }),
   previewTable: (id: string, schema: string, table: string, limit = 50) =>
     http<Env<RunOutcome>>('POST', `/api/connections/${id}/preview`, { schema, table, limit }),
+  profileTable: (id: string, schema: string, table: string) =>
+    http<Env<{ ok: boolean; error?: string; profile?: TableProfile }>>(
+      'POST', `/api/connections/${id}/profile`, { schema, table }),
   runSql: (id: string, sql: string, params: Record<string, unknown>) =>
     http<Env<RunOutcome>>('POST', `/api/connections/${id}/run-sql`, { sql, params }),
 
@@ -99,6 +102,11 @@ export const api = {
     http<Env<RunOutcome>>('POST', `/api/queries/${id}/run`, { params }),
 
   createTool: (p: Record<string, unknown>) => http<Env<{ id: string }>>('POST', '/api/tools', p),
+  scaffoldTools: (connection_id: string, schema: string, table: string, kinds?: string[]) =>
+    http<Env<{ created: string[] }>>('POST', '/api/tools/scaffold',
+      { connection_id, schema, table, kinds }),
+  magicTool: (connection_id: string, request: string) =>
+    http<Env<MagicResult>>('POST', '/api/tools/magic', { connection_id, request }),
   updateTool: (id: string, p: Record<string, unknown>) => http<Env>('PUT', `/api/tools/${id}`, p),
   deleteTool: (id: string) => http<Env>('DELETE', `/api/tools/${id}`),
   testTool: (id: string, args: Record<string, unknown>) =>
@@ -109,6 +117,8 @@ export const api = {
   deleteProject: (id: string) => http<Env>('DELETE', `/api/projects/${id}`),
   generateProject: (id: string) =>
     http<Env<{ files: Record<string, string> }>>('POST', `/api/projects/${id}/generate`),
+  preflight: (id: string) =>
+    http<Env<PreflightReport>>('POST', `/api/projects/${id}/preflight`),
   importProject: (bundle: unknown, connection_id?: string) =>
     http<Env<{ id: string }>>('POST', '/api/projects/import', { bundle, connection_id }),
   runProject: (id: string) => http<Env<RunnerStatus>>('POST', `/api/projects/${id}/run`),

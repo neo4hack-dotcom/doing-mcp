@@ -20,6 +20,7 @@ import connectors
 import guardrails
 import llm as llm_mod
 import mcp_client
+import rls
 import runner
 import storage
 
@@ -101,22 +102,43 @@ def guard_cfg(db: dict, overrides: dict | None = None) -> dict:
     return cfg
 
 
-def run_validated(db: dict, conn: dict, sql: str, params: dict, cfg: dict) -> dict:
-    """Validate then execute; never raises: {ok, error?, result?, validation}."""
+def run_validated(db: dict, conn: dict, sql: str, params: dict, cfg: dict,
+                  policy: dict | None = None, identity_value=None) -> dict:
+    """Validate then execute; never raises: {ok, error?, result?, validation, rls?}.
+
+    When a row policy is active, the (read-only) base query is wrapped as a subquery
+    and filtered on the projected columns for the captured caller identity.
+    """
     dialect = connectors.dialect(conn["kind"])
     validation = guardrails.validate(sql, dialect, cfg)
     if not validation["ok"]:
         return {"ok": False, "error": " ".join(validation["errors"]), "validation": validation}
+
+    effective_sql = validation["sql"]
+    exec_params = dict(params or {})
+    rls_summary = None
+    if rls.is_active(policy):
+        base = sql.rstrip().rstrip(";")
+        wrapped, rls_params = rls.wrap_sql(base, dialect, policy, identity_value)
+        effective_sql = (guardrails.apply_limit(wrapped, dialect, int(cfg.get("max_rows", 500)))
+                         if cfg.get("auto_limit", True) else wrapped)
+        exec_params.update(rls_params)
+        rls_summary = rls.describe(policy, identity_value)
+
     try:
         result = connectors.execute(
-            conn, validation["sql"], params,
+            conn, effective_sql, exec_params,
             max_rows=int(cfg.get("max_rows", 500)), timeout_s=int(cfg.get("timeout_s", 30)),
         )
         storage.metric_query(db, conn["id"], result["elapsed_ms"], result["row_count"], True)
-        return {"ok": True, "result": result, "validation": validation}
+        return {"ok": True, "result": result, "validation": validation, "rls": rls_summary}
     except Exception as exc:  # noqa: BLE001 — driver error surfaced to the UI for the “fix with AI” flow
         storage.metric_query(db, conn["id"], 0, 0, False)
-        return {"ok": False, "error": str(exc)[:600], "validation": validation}
+        msg = str(exc)[:600]
+        if rls_summary is not None:
+            msg = (f"{msg}\n(Row-level security is active — the policy columns must appear "
+                   f"in the tool's SELECT output.)")
+        return {"ok": False, "error": msg, "validation": validation, "rls": rls_summary}
 
 
 # ---------------------------------------------------------------- State & health
@@ -372,6 +394,23 @@ def preview_table(conn_id: str, payload: dict = Body(...),
             return envelope(db, {"ok": False, "error": str(exc)[:600]})
 
 
+@app.post("/api/connections/{conn_id}/profile")
+def profile_table(conn_id: str, payload: dict = Body(...),
+                  x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    """Column-level profiling: row count, nulls, distinct, min/max, top values."""
+    with mutation(x_base_version) as db:
+        conn = get_conn_or_404(db, conn_id)
+        try:
+            result = connectors.profile_table(conn, payload.get("schema", ""),
+                                              payload.get("table", ""))
+            storage.audit(db, "catalog.profile",
+                          f"{conn['name']}: {payload.get('schema')}.{payload.get('table')} "
+                          f"({result['row_count']} rows)")
+            return envelope(db, {"ok": True, "profile": result})
+        except Exception as exc:  # noqa: BLE001
+            return envelope(db, {"ok": False, "error": str(exc)[:600]})
+
+
 @app.post("/api/connections/{conn_id}/run-sql")
 def run_sql(conn_id: str, payload: dict = Body(...),
             x_base_version: str | None = Header(None, alias="X-Base-Version")):
@@ -479,6 +518,149 @@ def normalize_guardrails(gr: dict | None, defaults: dict) -> dict:
     }
 
 
+def _scaffold_templates(conn: dict, table: dict) -> dict[str, dict]:
+    """Deterministic starter tools for a table — no LLM required."""
+    kind = conn["kind"]
+    schema, name = table["schema"], table["name"]
+    ref = f'"{name}"' if kind == "demo" else f'"{schema}"."{name}"'
+    columns = table.get("columns", [])
+    col_names = [c["name"] for c in columns]
+
+    def first(predicate, fallback=None):
+        for col in columns:
+            if predicate(col):
+                return col["name"]
+        return fallback
+
+    pk = ("id" if "id" in col_names
+          else first(lambda c: c["name"].lower().endswith("_id"), col_names[0] if col_names else "id"))
+    text_col = first(lambda c: any(t in (c.get("type") or "").upper()
+                                   for t in ("CHAR", "TEXT", "STRING", "VARCHAR")))
+    group_col = first(lambda c: c["name"] != pk and any(
+        t in (c.get("type") or "").upper() for t in ("CHAR", "TEXT", "STRING", "VARCHAR")))
+
+    base = codegen.py_ident(name)
+    templates: dict[str, dict] = {
+        "list": {
+            "name": f"list_{base}",
+            "description": f"List rows from {schema}.{name} (capped by the row limit).",
+            "sql": f"SELECT * FROM {ref}",
+            "params": [],
+        },
+        "get_by_id": {
+            "name": f"get_{base}_by_{codegen.py_ident(pk)}",
+            "description": f"Fetch rows from {schema}.{name} matching a {pk}.",
+            "sql": f'SELECT * FROM {ref} WHERE "{pk}" = :{codegen.py_ident(pk)}',
+            "params": [{"name": codegen.py_ident(pk), "type": "string",
+                        "description": f"Value of {pk} to look up.", "required": True, "default": None}],
+        },
+    }
+    if group_col:
+        templates["count_by"] = {
+            "name": f"count_{base}_by_{codegen.py_ident(group_col)}",
+            "description": f"Count rows of {schema}.{name} grouped by {group_col}, most frequent first.",
+            "sql": (f'SELECT "{group_col}", COUNT(*) AS row_count FROM {ref} '
+                    f'GROUP BY "{group_col}" ORDER BY row_count DESC'),
+            "params": [],
+        }
+    if text_col:
+        templates["search"] = {
+            "name": f"search_{base}",
+            "description": f"Search {schema}.{name} where {text_col} matches a pattern (use % wildcards).",
+            "sql": f'SELECT * FROM {ref} WHERE "{text_col}" LIKE :pattern',
+            "params": [{"name": "pattern", "type": "string",
+                        "description": f"LIKE pattern applied to {text_col}, e.g. %john%.",
+                        "required": True, "default": None}],
+        }
+    return templates
+
+
+@app.post("/api/tools/scaffold")
+def scaffold_tools(payload: dict = Body(...),
+                   x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    """One-click starter tools (list / get_by_id / count_by / search) for a table."""
+    with mutation(x_base_version) as db:
+        conn = get_conn_or_404(db, payload.get("connection_id", ""))
+        catalog = db["catalog"].get(conn["id"]) or {"tables": []}
+        table = next((t for t in catalog["tables"]
+                      if t["schema"] == payload.get("schema") and t["name"] == payload.get("table")), None)
+        if not table:
+            raise HTTPException(404, "Table not found in the catalog — introspect first.")
+        templates = _scaffold_templates(conn, table)
+        kinds = [k for k in (payload.get("kinds") or list(templates)) if k in templates]
+        existing = {t["name"] for t in db["tools"]}
+        created = []
+        for kind_key in kinds:
+            tpl = templates[kind_key]
+            tool_name = tpl["name"]
+            while tool_name in existing:
+                tool_name += "_2"
+            existing.add(tool_name)
+            db["tools"].insert(0, {
+                "id": storage.new_id("tool"), "name": tool_name,
+                "description": tpl["description"], "connection_id": conn["id"],
+                "query_id": None, "sql": tpl["sql"], "params": tpl["params"],
+                "guardrails": normalize_guardrails(None, db["settings"]["guardrails"]),
+                "row_policy": rls.default_policy(),
+                "tags": ["scaffold", table["name"]], "enabled": True,
+                "security_review": None, "created_at": storage.now_iso(),
+            })
+            created.append(tool_name)
+        storage.audit(db, "tool.scaffold",
+                      f"{table['schema']}.{table['name']} → {', '.join(created) or 'nothing'}")
+        return envelope(db, {"created": created})
+
+
+@app.post("/api/tools/magic")
+def magic_tool(payload: dict = Body(...),
+               x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    """One-shot NL → tool: generate SQL, validate, dry-run, suggest the contract, create."""
+    with mutation(x_base_version) as db:
+        conn = get_conn_or_404(db, payload.get("connection_id", ""))
+        request = (payload.get("request") or "").strip()
+        if not request:
+            raise HTTPException(400, "Describe the tool you want in plain language.")
+        dialect = connectors.dialect(conn["kind"])
+        gen = llm_mod.generate_sql(db["settings"]["llm"], dialect,
+                                   schema_context(db, conn["id"]), request)
+        sql = gen["sql"]
+        validation = guardrails.validate(sql, dialect, guard_cfg(db))
+        if not validation["ok"]:
+            fixed = llm_mod.fix_sql(db["settings"]["llm"], dialect, schema_context(db, conn["id"]),
+                                    sql, " ".join(validation["errors"]))
+            sql = fixed["sql"]
+            validation = guardrails.validate(sql, dialect, guard_cfg(db))
+            if not validation["ok"]:
+                raise HTTPException(400, "The generated SQL failed the guardrails twice: "
+                                    + " ".join(validation["errors"]))
+        test_outcome = None
+        if not validation["params"]:
+            test_outcome = run_validated(db, conn, sql, {}, guard_cfg(db))
+        suggestion = llm_mod.suggest_tool(db["settings"]["llm"], dialect, sql, "", request)
+        declared = {p["name"]: p for p in normalize_params(suggestion.get("params"))}
+        params = [declared.get(name, {"name": name, "type": "string", "description": "",
+                                      "required": True, "default": None})
+                  for name in validation["params"]]
+        tool_name = codegen.py_ident(suggestion.get("name") or "tool")
+        existing = {t["name"] for t in db["tools"]}
+        while tool_name in existing:
+            tool_name += "_2"
+        tool = {
+            "id": storage.new_id("tool"), "name": tool_name,
+            "description": suggestion.get("description") or request,
+            "connection_id": conn["id"], "query_id": None, "sql": sql, "params": params,
+            "guardrails": normalize_guardrails(None, db["settings"]["guardrails"]),
+            "row_policy": rls.default_policy(),
+            "tags": [str(t) for t in (suggestion.get("tags") or [])][:5],
+            "enabled": True, "security_review": None, "created_at": storage.now_iso(),
+        }
+        db["tools"].insert(0, tool)
+        storage.audit(db, "tool.magic", f"{tool_name} ← “{request[:120]}”")
+        return envelope(db, {"id": tool["id"], "name": tool_name, "sql": sql,
+                             "explanation": gen.get("explanation", ""),
+                             "validation": validation, "test": test_outcome})
+
+
 @app.post("/api/tools")
 def create_tool(payload: dict = Body(...),
                 x_base_version: str | None = Header(None, alias="X-Base-Version")):
@@ -497,6 +679,7 @@ def create_tool(payload: dict = Body(...),
             "sql": sql,
             "params": normalize_params(payload.get("params")),
             "guardrails": normalize_guardrails(payload.get("guardrails"), db["settings"]["guardrails"]),
+            "row_policy": rls.normalize(payload.get("row_policy")),
             "tags": [str(t) for t in (payload.get("tags") or [])],
             "enabled": True,
             "security_review": payload.get("security_review"),
@@ -536,6 +719,8 @@ def update_tool(tool_id: str, payload: dict = Body(...),
             tool["params"] = normalize_params(payload["params"])
         if "guardrails" in payload:
             tool["guardrails"] = normalize_guardrails(payload["guardrails"], db["settings"]["guardrails"])
+        if "row_policy" in payload:
+            tool["row_policy"] = rls.normalize(payload["row_policy"])
         storage.audit(db, "tool.update", tool["name"])
         return envelope(db)
 
@@ -563,6 +748,14 @@ def test_tool(tool_id: str, payload: dict = Body(default={}),
             raise HTTPException(404, "Tool not found.")
         conn = get_conn_or_404(db, tool["connection_id"])
         args = payload.get("args") or {}
+        policy = tool.get("row_policy") or {}
+        identity_value = None
+        if rls.is_active(policy):
+            identity_value = args.get(policy.get("identity_arg", "user_id"))
+            if identity_value in (None, ""):
+                return envelope(db, {"ok": False,
+                                     "error": f"Row-level security is on: provide the caller identity "
+                                              f"“{policy.get('identity_arg', 'user_id')}”."})
         coerced = {}
         for param in tool["params"]:
             value = args.get(param["name"], param.get("default"))
@@ -585,7 +778,8 @@ def test_tool(tool_id: str, payload: dict = Body(default={}),
                                      "error": f"Invalid value for {param['name']} ({param['type']})."})
             coerced[param["name"]] = value
         cfg = guard_cfg(db, tool.get("guardrails"))
-        outcome = run_validated(db, conn, tool["sql"], coerced, cfg)
+        outcome = run_validated(db, conn, tool["sql"], coerced, cfg,
+                                policy=policy, identity_value=identity_value)
         if outcome["ok"]:
             masked = {m.lower() for m in tool["guardrails"].get("masked_columns", [])}
             if masked:
@@ -593,7 +787,8 @@ def test_tool(tool_id: str, payload: dict = Body(default={}),
                 for row in outcome["result"]["rows"]:
                     for i in idx:
                         row[i] = "•••"
-        storage.audit(db, "tool.test", f"{tool['name']} → {'OK' if outcome['ok'] else 'FAILED'}",
+        rls_note = f" [RLS: {outcome['rls']}]" if outcome.get("rls") else ""
+        storage.audit(db, "tool.test", f"{tool['name']} → {'OK' if outcome['ok'] else 'FAILED'}{rls_note}",
                       "info" if outcome["ok"] else "error")
         return envelope(db, outcome)
 
@@ -679,6 +874,88 @@ def generate_project(project_id: str,
         storage.audit(db, "project.generate",
                       f"{project['name']}: {len(files)} files, {len(project['tool_ids'])} tools")
         return envelope(db, {"files": files})
+
+
+@app.post("/api/projects/{project_id}/preflight")
+def preflight_project(project_id: str,
+                      x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    """Pre-ship checklist: tools, guardrails, params, RLS coherence, connections."""
+    with mutation(x_base_version) as db:
+        project = storage.find(db["projects"], project_id)
+        if not project:
+            raise HTTPException(404, "Project not found.")
+        items: list[dict] = []
+
+        def add(level: str, label: str, detail: str = ""):
+            items.append({"level": level, "label": label, "detail": detail})
+
+        tools = [t for t in db["tools"] if t["id"] in project.get("tool_ids", [])]
+        enabled = [t for t in tools if t.get("enabled", True)]
+        if not enabled:
+            add("fail", "At least one enabled tool", "The project has no enabled tool.")
+        else:
+            add("pass", "Enabled tools", f"{len(enabled)} tool(s) will be exposed.")
+
+        conn_ids = {t["connection_id"] for t in enabled}
+        for cid in conn_ids:
+            conn = storage.find(db["connections"], cid)
+            if not conn:
+                add("fail", "Connection exists", f"A tool references a deleted connection ({cid}).")
+                continue
+            result = connectors.test(conn)
+            conn["status"] = "ok" if result["ok"] else "error"
+            conn["latency_ms"] = result["latency_ms"]
+            conn["last_tested_at"] = storage.now_iso()
+            add("pass" if result["ok"] else "fail", f"Connection “{conn['name']}”",
+                result["message"])
+
+        for tool in enabled:
+            conn = storage.find(db["connections"], tool["connection_id"])
+            dialect = connectors.dialect(conn["kind"]) if conn else "sqlite"
+            validation = guardrails.validate(tool["sql"], dialect, guard_cfg(db, tool.get("guardrails")))
+            if validation["ok"]:
+                add("pass", f"Guardrails — {tool['name']}", "SQL accepted (read-only, safe keywords).")
+            else:
+                add("fail", f"Guardrails — {tool['name']}", " ".join(validation["errors"]))
+            declared = {p["name"] for p in tool.get("params", [])}
+            sql_params = set(validation["params"])
+            if declared != sql_params:
+                missing = sorted(sql_params - declared)
+                extra = sorted(declared - sql_params)
+                detail = (f"missing in contract: {', '.join(missing)}. " if missing else "") + \
+                         (f"declared but unused: {', '.join(extra)}." if extra else "")
+                add("warn", f"Parameters — {tool['name']}", detail.strip())
+            policy = tool.get("row_policy") or {}
+            if rls.is_active(policy):
+                stripped = guardrails.strip_literals(tool["sql"]).lower()
+                ghost = [r["column"] for r in policy["rules"]
+                         if not (f'"{r["column"].lower()}"' in stripped
+                                 or f" {r['column'].lower()}" in stripped
+                                 or "select *" in stripped or "select\n*" in stripped)]
+                if ghost:
+                    add("warn", f"Row-level security — {tool['name']}",
+                        f"Policy column(s) possibly absent from the SELECT output: {', '.join(sorted(set(ghost)))}.")
+                else:
+                    add("pass", f"Row-level security — {tool['name']}",
+                        f"{len(policy['rules'])} rule(s), identity “{policy['identity_arg']}”, "
+                        f"default {policy['default_visibility']}.")
+            masked = (tool.get("guardrails") or {}).get("masked_columns", [])
+            if masked:
+                add("pass", f"PII masking — {tool['name']}", ", ".join(masked))
+
+        if db["settings"]["llm"].get("last_test", {}) and db["settings"]["llm"]["last_test"] \
+                and db["settings"]["llm"]["last_test"].get("ok"):
+            add("pass", "Local LLM", "Tested OK (only needed for the integrated chat).")
+        else:
+            add("warn", "Local LLM", "Not tested — the generated server works without it, "
+                                     "but the integrated chat needs it.")
+
+        ok = not any(i["level"] == "fail" for i in items)
+        storage.audit(db, "project.preflight",
+                      f"{project['name']} → {'READY' if ok else 'BLOCKED'} "
+                      f"({sum(1 for i in items if i['level'] == 'fail')} fail / "
+                      f"{sum(1 for i in items if i['level'] == 'warn')} warn)")
+        return envelope(db, {"ok": ok, "items": items})
 
 
 @app.get("/api/projects/{project_id}/export")
