@@ -36,7 +36,18 @@ function Shell() {
   const [offline, setOffline] = useState(false)
   const [tab, setTab] = useState<string>(() => localStorage.getItem('doing.tab') ?? 'dashboard')
   const [dark, setDark] = useState<boolean>(() => localStorage.getItem('doing.theme') !== 'light')
+  const [pins, setPins] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('doing.pins') ?? '[]') as string[] } catch { return [] }
+  })
   const toast = useToast()
+
+  const togglePin = useCallback((key: string) => {
+    setPins((prev) => {
+      const next = prev.includes(key) ? prev.filter((p) => p !== key) : [...prev, key]
+      localStorage.setItem('doing.pins', JSON.stringify(next))
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
@@ -94,7 +105,7 @@ function Shell() {
     )
   }
 
-  const tabProps = { db, apply, goTo }
+  const tabProps = { db, apply, goTo, pins, togglePin }
   const llmOk = Boolean(db.settings.llm.last_test?.ok)
 
   return (

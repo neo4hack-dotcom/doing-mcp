@@ -205,6 +205,34 @@ export interface Envelope<T = unknown> {
   result: T
 }
 
+export type BrowseOp =
+  | 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'
+  | 'contains' | 'starts' | 'is_null' | 'not_null'
+
+export interface BrowseFilter {
+  column: string
+  op: BrowseOp
+  value: string
+}
+
+export interface BrowseSort {
+  column: string
+  dir: 'asc' | 'desc'
+}
+
+export const BROWSE_OPS: { id: BrowseOp; label: string; needsValue: boolean }[] = [
+  { id: 'contains', label: 'contains', needsValue: true },
+  { id: 'eq', label: '=', needsValue: true },
+  { id: 'neq', label: '≠', needsValue: true },
+  { id: 'gt', label: '>', needsValue: true },
+  { id: 'gte', label: '≥', needsValue: true },
+  { id: 'lt', label: '<', needsValue: true },
+  { id: 'lte', label: '≤', needsValue: true },
+  { id: 'starts', label: 'starts with', needsValue: true },
+  { id: 'is_null', label: 'is empty', needsValue: false },
+  { id: 'not_null', label: 'is not empty', needsValue: false },
+]
+
 export interface ColumnProfile {
   name: string
   type: string

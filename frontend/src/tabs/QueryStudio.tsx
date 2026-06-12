@@ -1,13 +1,14 @@
 // SQL Studio tab: NL→SQL via local LLM, guardrail validation, execution,
-// plain-English explanation, auto-repair, query saving.
+// plain-English explanation, auto-repair, query saving. The draft (SQL + prompt)
+// survives tab switches, and pinned fields from the Explorer are one drag away.
 import {
   Hammer, MessageCircleQuestion, Play, Save, ShieldCheck, Sparkles, SquareTerminal,
   Trash2, Wand2,
 } from 'lucide-react'
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { DragEvent } from 'react'
 import { api } from '../api'
-import { GuardrailPanel, ParamInputs, ResultsTable, SchemaTree } from '../components/data'
+import { GuardrailPanel, ParamInputs, PinnedFields, ResultsTable, SchemaTree } from '../components/data'
 import {
   Badge, Button, Card, EmptyState, Field, Input, Modal, Select, Textarea,
   useBusy, useConfirm, useToast,
@@ -15,12 +16,12 @@ import {
 import type { RunOutcome, ToolParam, Validation } from '../types'
 import { dialectOf } from '../types'
 import type { TabProps } from './shared'
-import { detectParams } from './shared'
+import { detectParams, rememberConn, rememberedConn } from './shared'
 
-export default function QueryStudio({ db, apply, goTo }: TabProps) {
-  const [connId, setConnId] = useState(() => db.connections[0]?.id ?? '')
-  const [sql, setSql] = useState('')
-  const [nl, setNl] = useState('')
+export default function QueryStudio({ db, apply, goTo, pins, togglePin }: TabProps) {
+  const [connId, setConnId] = useState(() => rememberedConn(db))
+  const [sql, setSql] = useState(() => localStorage.getItem('doing.studio.sql') ?? '')
+  const [nl, setNl] = useState(() => localStorage.getItem('doing.studio.nl') ?? '')
   const [paramValues, setParamValues] = useState<Record<string, string>>({})
   const [outcome, setOutcome] = useState<RunOutcome | null>(null)
   const [validation, setValidation] = useState<Validation | null>(null)
@@ -32,6 +33,22 @@ export default function QueryStudio({ db, apply, goTo }: TabProps) {
   const [busy, run] = useBusy()
   const toast = useToast()
   const confirm = useConfirm()
+
+  // The work-in-progress query survives Explorer ↔ Studio round trips.
+  useEffect(() => { localStorage.setItem('doing.studio.sql', sql) }, [sql])
+  useEffect(() => { localStorage.setItem('doing.studio.nl', nl) }, [nl])
+
+  const insertAtCursor = (text: string) => {
+    const el = editorRef.current
+    const pos = el ? el.selectionStart : sql.length
+    const needsSpace = pos > 0 && !/[\s,(]$/.test(sql.slice(0, pos))
+    const inserted = (needsSpace ? ' ' : '') + text
+    setSql(sql.slice(0, pos) + inserted + sql.slice(pos))
+    requestAnimationFrame(() => {
+      el?.focus()
+      el?.setSelectionRange(pos + inserted.length, pos + inserted.length)
+    })
+  }
 
   const conn = db.connections.find((c) => c.id === connId) ?? db.connections[0]
   const catalog = conn ? db.catalog[conn.id] : undefined
@@ -125,15 +142,26 @@ export default function QueryStudio({ db, apply, goTo }: TabProps) {
             Describe your need in plain English, the local LLM writes the SQL. Drag & drop tables into the editor.
           </p>
         </div>
-        <Select value={conn?.id ?? ''} onChange={(e) => setConnId(e.target.value)} className="w-56">
+        <Select value={conn?.id ?? ''} onChange={(e) => { setConnId(e.target.value); rememberConn(e.target.value) }} className="w-56">
           {db.connections.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
         </Select>
       </div>
 
+      <PinnedFields pins={pins} onTogglePin={togglePin} onInsert={insertAtCursor} />
+
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-4">
         <div className="space-y-4 xl:col-span-1">
-          <Card title="Schema" subtitle="Drag a table into the editor">
-            <SchemaTree catalog={catalog} draggable />
+          <Card
+            title="Schema"
+            subtitle="Drag tables or fields into the editor — ★ to pin"
+            actions={
+              <Button size="sm" variant="ghost" onClick={() => goTo('catalog')}
+                title="Check the data in the Explorer — your query draft is kept">
+                Explorer →
+              </Button>
+            }
+          >
+            <SchemaTree catalog={catalog} draggable pins={pins} onTogglePin={togglePin} />
           </Card>
           <Card title={`Saved queries (${queries.length})`}>
             {queries.length === 0 ? (
@@ -188,7 +216,7 @@ export default function QueryStudio({ db, apply, goTo }: TabProps) {
               <div className="flex gap-1.5">
                 <Button size="sm" variant="outline" icon={ShieldCheck} busy={busy === 'validate'} onClick={validate} disabled={!sql.trim()}>Validate</Button>
                 <Button size="sm" variant="outline" icon={MessageCircleQuestion} busy={busy === 'explain'} onClick={explain} disabled={!sql.trim()}>Explain</Button>
-                <Button size="sm" icon={Play} busy={busy === 'run'} onClick={execute} disabled={!sql.trim()}>Run</Button>
+                <Button size="sm" icon={Play} busy={busy === 'run'} onClick={execute} disabled={!sql.trim()} title="⌘/Ctrl + Enter">Run</Button>
               </div>
             }
           >
@@ -198,6 +226,12 @@ export default function QueryStudio({ db, apply, goTo }: TabProps) {
               onChange={(e) => setSql(e.target.value)}
               onDrop={onDrop}
               onDragOver={(e) => e.preventDefault()}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && sql.trim()) {
+                  e.preventDefault()
+                  execute()
+                }
+              }}
               rows={9}
               spellCheck={false}
               placeholder={'SELECT country, COUNT(*) AS clients\nFROM customers\nWHERE segment = :segment\nGROUP BY country\nORDER BY clients DESC'}

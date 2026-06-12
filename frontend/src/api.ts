@@ -1,7 +1,8 @@
 // DOINg.MCP — API client: X-Base-Version optimistic versioning, typed errors.
 import type {
-  ChatResult, Envelope, LlmTestResult, MagicResult, PreflightReport, RunOutcome,
-  RunnerStatus, SecurityReview, SqlSuggestion, TableProfile, ToolSuggestion, Validation,
+  BrowseFilter, BrowseSort, ChatResult, Envelope, LlmTestResult, MagicResult,
+  PreflightReport, RunOutcome, RunnerStatus, SecurityReview, SqlSuggestion,
+  TableProfile, ToolSuggestion, Validation,
 } from './types'
 
 export class ApiError extends Error {
@@ -86,7 +87,11 @@ export const api = {
     http<Env<{ ok: boolean; latency_ms: number; message: string }>>('POST', `/api/connections/${id}/test`),
   introspect: (id: string) => http<Env<{ tables: number }>>('POST', `/api/connections/${id}/introspect`),
   enrich: (id: string, table_keys?: string[]) =>
-    http<Env<{ enriched: number }>>('POST', `/api/connections/${id}/enrich`, { table_keys }),
+    http<Env<{ enriched: number; failed: string[] }>>('POST', `/api/connections/${id}/enrich`, { table_keys }),
+  browseTable: (id: string, schema: string, table: string, filters: BrowseFilter[],
+                sort: BrowseSort | null, limit: number) =>
+    http<{ result: RunOutcome }>('POST', `/api/connections/${id}/browse`,
+      { schema, table, filters, sort, limit }),
   previewTable: (id: string, schema: string, table: string, limit = 50) =>
     http<Env<RunOutcome>>('POST', `/api/connections/${id}/preview`, { schema, table, limit }),
   profileTable: (id: string, schema: string, table: string) =>

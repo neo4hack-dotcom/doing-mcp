@@ -106,8 +106,15 @@ def chat_with_tools(llm: dict, messages: list[dict], tools: list[dict],
 
 
 def parse_json_loose(text: str):
-    """Tolerant parse: strip markdown fences, isolate the first JSON object/array."""
-    cleaned = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text.strip(), flags=re.MULTILINE).strip()
+    """Tolerant parse for local models: strips <think> blocks and markdown fences,
+    isolates the first JSON object/array, repairs trailing commas."""
+    # Reasoning models (deepseek-r1, qwq…) prepend a chain-of-thought block.
+    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+    # Prefer the first fenced code block wherever it sits in the reply.
+    fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.DOTALL)
+    if fence:
+        cleaned = fence.group(1)
+    cleaned = cleaned.strip()
     for candidate in (cleaned, text):
         try:
             return json.loads(candidate)
@@ -117,10 +124,12 @@ def parse_json_loose(text: str):
         start = cleaned.find(open_ch)
         end = cleaned.rfind(close_ch)
         if 0 <= start < end:
-            try:
-                return json.loads(cleaned[start:end + 1])
-            except ValueError:
-                continue
+            snippet = cleaned[start:end + 1]
+            for attempt in (snippet, re.sub(r",\s*([}\]])", r"\1", snippet)):
+                try:
+                    return json.loads(attempt)
+                except ValueError:
+                    continue
     raise LlmError("The LLM did not return usable JSON:\n" + text[:300])
 
 
@@ -213,8 +222,9 @@ def enrich_catalog(llm: dict, tables: list[dict]) -> list[dict]:
         "in English (1-2 sentences), and for each column a short English description plus "
         "a boolean pii=true if the column likely contains personal or sensitive data "
         "(email, name, phone, address, IP, bank identifier…). "
-        "Reply STRICTLY in JSON: [{\"schema\": \"...\", \"name\": \"...\", \"description\": \"...\", "
-        "\"columns\": [{\"name\": \"...\", \"description\": \"...\", \"pii\": false}]}]."
+        "Reply with ONLY a JSON array — no prose, no markdown fences: "
+        "[{\"schema\": \"...\", \"name\": \"...\", \"description\": \"...\", "
+        "\"columns\": [{\"name\": \"...\", \"description\": \"...\", \"pii\": false}]}]"
     )
     payload = json.dumps(
         [{"schema": t["schema"], "name": t["name"],

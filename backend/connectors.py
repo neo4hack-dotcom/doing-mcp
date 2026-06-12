@@ -370,6 +370,64 @@ def profile_table(conn: dict, schema: str, table: str,
     return {"schema": schema, "table": table, "row_count": total, "columns": out_cols}
 
 
+BROWSE_OPS = {"eq": "=", "neq": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+_NUM_VALUE_RE = re.compile(r"-?\d+(\.\d+)?")
+
+
+def _coerce_value(value) -> object:
+    text = str(value).strip()
+    if _NUM_VALUE_RE.fullmatch(text):
+        return float(text) if "." in text else int(text)
+    return text
+
+
+def browse(conn: dict, schema: str, table: str, filters: list | None = None,
+           sort: dict | None = None, limit: int = 100) -> dict:
+    """Metabase-style table browsing: whitelisted operators, bound parameters,
+    identifiers validated against the live introspection — injection-proof."""
+    known = {(t["schema"], t["name"]) for t in list_tables(conn)}
+    if (schema, table) not in known:
+        raise RuntimeError(f"Unknown table: {schema}.{table}")
+    valid_cols = {c["name"] for c in list_columns(conn, schema, table)}
+    ref = _table_ref(conn, schema, table)
+    limit = max(1, min(int(limit), 1000))
+
+    where, params = [], {}
+    for i, flt in enumerate((filters or [])[:12]):
+        col = str(flt.get("column") or "")
+        op = str(flt.get("op") or "")
+        if col not in valid_cols:
+            raise RuntimeError(f"Unknown column: {col}")
+        qc = f'"{col}"'
+        key = f"b{i}"
+        value = flt.get("value", "")
+        if op in BROWSE_OPS:
+            where.append(f"{qc} {BROWSE_OPS[op]} :{key}")
+            params[key] = _coerce_value(value)
+        elif op == "contains":
+            where.append(f"{qc} LIKE :{key}")
+            params[key] = f"%{value}%"
+        elif op == "starts":
+            where.append(f"{qc} LIKE :{key}")
+            params[key] = f"{value}%"
+        elif op == "is_null":
+            where.append(f"{qc} IS NULL")
+        elif op == "not_null":
+            where.append(f"{qc} IS NOT NULL")
+        else:
+            raise RuntimeError(f"Unknown operator: {op}")
+
+    sql = f"SELECT * FROM {ref}"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    if sort and sort.get("column") in valid_cols:
+        direction = "DESC" if str(sort.get("dir", "asc")).lower() == "desc" else "ASC"
+        sql += f' ORDER BY "{sort["column"]}" {direction}'
+    sql += (f"\nFETCH FIRST {limit} ROWS ONLY" if conn.get("kind") == "oracle"
+            else f"\nLIMIT {limit}")
+    return execute(conn, sql, params, max_rows=limit, timeout_s=30)
+
+
 def execute(conn: dict, sql: str, params: dict, max_rows: int = 500, timeout_s: int = 30) -> dict:
     """Execute a SELECT already validated by the guardrails. Returns JSON-safe columns + rows."""
     kind = conn.get("kind")
