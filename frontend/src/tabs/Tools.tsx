@@ -1,7 +1,7 @@
 // Tools tab: turn a query into an MCP tool — AI contract suggestion,
 // per-tool guardrails (rows, timeout, rate, PII masking), LLM security review, playground.
 import {
-  FlaskConical, Hammer, Pencil, Plus, ShieldAlert, Sparkles, Trash2,
+  FlaskConical, Hammer, Lock, Pencil, Plus, ShieldAlert, Sparkles, Trash2, Wand2, X,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { api } from '../api'
@@ -10,8 +10,10 @@ import {
   Badge, Button, Card, EmptyState, Field, Input, Modal, Select, Textarea,
   Toggle, useBusy, useConfirm, useToast,
 } from '../components/ui'
-import type { ParamType, RunOutcome, SecurityReview, ToolDef, ToolParam } from '../types'
-import { dialectOf } from '../types'
+import type {
+  ParamType, RowPolicy, RunOutcome, SecurityReview, ToolDef, ToolParam,
+} from '../types'
+import { EMPTY_POLICY, dialectOf } from '../types'
 import type { TabProps } from './shared'
 import { detectParams } from './shared'
 
@@ -29,6 +31,7 @@ interface ToolForm {
   masked_columns: string
   tags: string
   security_review: SecurityReview | null
+  row_policy: RowPolicy
 }
 
 const PARAM_TYPES: ParamType[] = ['string', 'integer', 'number', 'boolean', 'date']
@@ -38,6 +41,7 @@ function emptyForm(connId: string): ToolForm {
     id: null, name: '', description: '', connection_id: connId, query_id: null,
     sql: '', params: [], max_rows: '500', timeout_s: '30', rate_per_min: '120',
     masked_columns: '', tags: '', security_review: null,
+    row_policy: { ...EMPTY_POLICY, rules: [] },
   }
 }
 
@@ -51,10 +55,21 @@ export default function Tools({ db, apply, goTo }: TabProps) {
   const [form, setForm] = useState<ToolForm | null>(null)
   const [testTool, setTestTool] = useState<ToolDef | null>(null)
   const [testValues, setTestValues] = useState<Record<string, string>>({})
+  const [testIdentity, setTestIdentity] = useState('')
   const [testOutcome, setTestOutcome] = useState<RunOutcome | null>(null)
+  const [magicPrompt, setMagicPrompt] = useState('')
+  const [magicConn, setMagicConn] = useState(() => db.connections[0]?.id ?? '')
   const [busy, run] = useBusy()
   const toast = useToast()
   const confirm = useConfirm()
+
+  const magic = () => run('magic', async () => {
+    const env = await api.magicTool(magicConn, magicPrompt)
+    apply(env)
+    setMagicPrompt('')
+    const tested = env.result.test?.ok ? ' Dry-run OK.' : ''
+    toast.push(`Tool “${env.result.name}” created from your description.${tested} Review it below.`, 'success')
+  })
 
   const connOf = (id: string) => db.connections.find((c) => c.id === id)
   const piiColumns = useMemo(() => {
@@ -91,6 +106,9 @@ export default function Tools({ db, apply, goTo }: TabProps) {
     timeout_s: String(tool.guardrails.timeout_s), rate_per_min: String(tool.guardrails.rate_per_min),
     masked_columns: tool.guardrails.masked_columns.join(', '),
     tags: tool.tags.join(', '), security_review: tool.security_review ?? null,
+    row_policy: tool.row_policy
+      ? { ...tool.row_policy, rules: tool.row_policy.rules.map((r) => ({ ...r })) }
+      : { ...EMPTY_POLICY, rules: [] },
   })
 
   const suggest = () => form && run('suggest', async () => {
@@ -128,6 +146,16 @@ export default function Tools({ db, apply, goTo }: TabProps) {
       },
       tags: form.tags.split(',').map((s) => s.trim()).filter(Boolean),
       security_review: form.security_review,
+      row_policy: {
+        ...form.row_policy,
+        rules: form.row_policy.rules
+          .map((r) => ({
+            subjects: r.subjects.map((s) => s.trim()).filter(Boolean),
+            column: r.column.trim(),
+            values: r.values.map((s) => s.trim()).filter(Boolean),
+          }))
+          .filter((r) => r.subjects.length > 0 && r.column && r.values.length > 0),
+      },
     }
     const env = form.id ? await api.updateTool(form.id, payload) : await api.createTool(payload)
     apply(env)
@@ -136,7 +164,12 @@ export default function Tools({ db, apply, goTo }: TabProps) {
   })
 
   const runTest = () => testTool && run('test', async () => {
-    const env = await api.testTool(testTool.id, testValues)
+    const args: Record<string, string> = { ...testValues }
+    const policy = testTool.row_policy
+    if (policy?.enabled && policy.rules.length > 0 && testIdentity) {
+      args[policy.identity_arg] = testIdentity
+    }
+    const env = await api.testTool(testTool.id, args)
     apply(env)
     setTestOutcome(env.result)
   })
@@ -184,6 +217,25 @@ export default function Tools({ db, apply, goTo }: TabProps) {
         </div>
       </div>
 
+      {db.connections.length > 0 && (
+        <Card title="Magic tool" subtitle="Describe it — the local LLM writes the SQL, names the tool, documents the contract and creates it.">
+          <div className="flex gap-2">
+            <Select value={magicConn} onChange={(e) => setMagicConn(e.target.value)} className="w-52">
+              {db.connections.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </Select>
+            <Input
+              value={magicPrompt}
+              onChange={(e) => setMagicPrompt(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && magicPrompt.trim()) magic() }}
+              placeholder="e.g. monthly revenue for a given country, most recent month first"
+            />
+            <Button icon={Wand2} busy={busy === 'magic'} onClick={magic} disabled={!magicPrompt.trim()}>
+              Create the tool
+            </Button>
+          </div>
+        </Card>
+      )}
+
       {db.tools.length === 0 ? (
         <EmptyState
           icon={Hammer}
@@ -204,6 +256,9 @@ export default function Tools({ db, apply, goTo }: TabProps) {
                       {!tool.enabled && <Badge tone="gray">disabled</Badge>}
                       {tool.security_review && <RiskBadge risk={tool.security_review.risk} />}
                       {tool.guardrails.masked_columns.length > 0 && <Badge tone="red">PII masked</Badge>}
+                      {tool.row_policy?.enabled && tool.row_policy.rules.length > 0 && (
+                        <Badge tone="amber"><Lock size={10} /> RLS</Badge>
+                      )}
                     </div>
                     <p className="mt-1 line-clamp-2 text-xs text-zinc-500 dark:text-zinc-400">{tool.description || '(no description)'}</p>
                   </div>
@@ -218,7 +273,7 @@ export default function Tools({ db, apply, goTo }: TabProps) {
                 </div>
                 <div className="mt-3 flex gap-1.5">
                   <Button size="sm" variant="outline" icon={FlaskConical}
-                    onClick={() => { setTestTool(tool); setTestValues({}); setTestOutcome(null) }}>
+                    onClick={() => { setTestTool(tool); setTestValues({}); setTestIdentity(''); setTestOutcome(null) }}>
                     Test
                   </Button>
                   <Button size="sm" variant="ghost" icon={Pencil} onClick={() => openEdit(tool)}>Edit</Button>
@@ -315,6 +370,89 @@ export default function Tools({ db, apply, goTo }: TabProps) {
               <Input value={form.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="sales, reporting" />
             </Field>
 
+            {/* ----- Row-level security ----- */}
+            <div className="rounded-lg border border-amber-200 bg-amber-50/40 p-3 dark:border-amber-900/60 dark:bg-amber-950/20">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Lock size={14} className="text-amber-600" />
+                  <span className="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-400">
+                    Row-level security
+                  </span>
+                </div>
+                <Toggle
+                  checked={form.row_policy.enabled}
+                  onChange={(enabled) => set({ row_policy: { ...form.row_policy, enabled } })}
+                  label={form.row_policy.enabled ? 'enabled' : 'disabled'}
+                />
+              </div>
+              {form.row_policy.enabled && (
+                <div className="mt-3 space-y-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label="Identity argument" hint="Extra tool argument capturing who calls (e.g. user_id). Required at every call.">
+                      <Input
+                        value={form.row_policy.identity_arg}
+                        onChange={(e) => set({ row_policy: { ...form.row_policy, identity_arg: e.target.value } })}
+                        className="font-mono text-xs"
+                      />
+                    </Field>
+                    <Field label="Caller without matching rule" hint="“Sees nothing” is the safe default (fail-closed).">
+                      <Select
+                        value={form.row_policy.default_visibility}
+                        onChange={(e) => set({ row_policy: { ...form.row_policy, default_visibility: e.target.value as 'deny' | 'all' } })}
+                      >
+                        <option value="deny">Sees nothing (deny)</option>
+                        <option value="all">Sees everything (all)</option>
+                      </Select>
+                    </Field>
+                  </div>
+                  <div>
+                    <p className="mb-1.5 text-[11px] text-zinc-500">
+                      Each rule: <b>these callers</b> can see <b>these values</b> of <b>this column</b>.
+                      Rules on the same column add up (OR); different columns combine (AND).
+                      Use <span className="font-mono">*</span> as caller to target everyone.
+                      The column must appear in the SELECT output.
+                    </p>
+                    <div className="space-y-1.5">
+                      {form.row_policy.rules.map((rule, index) => (
+                        <div key={index} className="grid grid-cols-12 items-center gap-2 rounded-md border border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-900">
+                          <Input
+                            value={rule.subjects.join(', ')}
+                            onChange={(e) => set({ row_policy: { ...form.row_policy, rules: form.row_policy.rules.map((r, i) => i === index ? { ...r, subjects: e.target.value.split(',') } : r) } })}
+                            placeholder="callers: u123, u456 or *"
+                            className="col-span-4 !py-1 font-mono text-[11px]"
+                          />
+                          <Input
+                            value={rule.column}
+                            onChange={(e) => set({ row_policy: { ...form.row_policy, rules: form.row_policy.rules.map((r, i) => i === index ? { ...r, column: e.target.value } : r) } })}
+                            placeholder="column (A or B…)"
+                            className="col-span-3 !py-1 font-mono text-[11px]"
+                          />
+                          <Input
+                            value={rule.values.join(', ')}
+                            onChange={(e) => set({ row_policy: { ...form.row_policy, rules: form.row_policy.rules.map((r, i) => i === index ? { ...r, values: e.target.value.split(',') } : r) } })}
+                            placeholder="allowed values: FR, BE, 42…"
+                            className="col-span-4 !py-1 font-mono text-[11px]"
+                          />
+                          <button
+                            onClick={() => set({ row_policy: { ...form.row_policy, rules: form.row_policy.rules.filter((_, i) => i !== index) } })}
+                            className="col-span-1 text-red-400 hover:text-red-600"
+                          >
+                            <X size={13} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                    <Button
+                      size="sm" variant="outline" icon={Plus} className="mt-2"
+                      onClick={() => set({ row_policy: { ...form.row_policy, rules: [...form.row_policy.rules, { subjects: [], column: '', values: [] }] } })}
+                    >
+                      Add a rule
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {form.security_review && (
               <div className="rounded-lg border border-zinc-200 p-3 text-xs dark:border-zinc-700">
                 <div className="mb-1.5 flex items-center gap-2 font-medium">
@@ -350,6 +488,19 @@ export default function Tools({ db, apply, goTo }: TabProps) {
         {testTool && (
           <div className="space-y-4">
             <p className="text-xs text-zinc-500">{testTool.description}</p>
+            {testTool.row_policy?.enabled && testTool.row_policy.rules.length > 0 && (
+              <Field
+                label={`Caller identity — ${testTool.row_policy.identity_arg}`}
+                hint="Row-level security is on: results are filtered as this caller would see them."
+              >
+                <Input
+                  value={testIdentity}
+                  onChange={(e) => setTestIdentity(e.target.value)}
+                  placeholder="e.g. u123, alice…"
+                  className="font-mono text-xs"
+                />
+              </Field>
+            )}
             <ParamInputs
               params={testTool.params}
               values={testValues}

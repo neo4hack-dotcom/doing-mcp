@@ -1,8 +1,9 @@
 // MCP Projects tab: compose a server by dragging tools in, generate the FastMCP code,
 // export it as a ZIP, run it locally (HTTP) and follow its logs.
 import {
-  ArrowDown, ArrowUp, Boxes, Download, FileCode2, FileJson, MessageSquare, Play, Plus,
-  ScrollText, Square, Trash2, Upload, X,
+  AlertTriangle, ArrowDown, ArrowUp, Boxes, CheckCircle2, ClipboardCheck, Download,
+  FileCode2, FileJson, MessageSquare, Play, Plus, ScrollText, Square, Trash2, Upload,
+  X, XCircle,
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DragEvent } from 'react'
@@ -12,7 +13,7 @@ import {
   Badge, Button, Card, CodeBlock, EmptyState, Field, Input, Modal, Select,
   Textarea, cls, useBusy, useConfirm, useToast,
 } from '../components/ui'
-import type { Project, RunnerStatus } from '../types'
+import type { PreflightReport, Project, RunnerStatus } from '../types'
 import type { TabProps } from './shared'
 import { downloadText } from './shared'
 
@@ -25,6 +26,7 @@ export default function Projects({ db, apply, goTo }: TabProps) {
   const [activeFile, setActiveFile] = useState('server.py')
   const [logs, setLogs] = useState<string | null>(null)
   const [chatOpen, setChatOpen] = useState(false)
+  const [preflight, setPreflight] = useState<PreflightReport | null>(null)
   const [status, setStatus] = useState<RunnerStatus | null>(null)
   const [dragOver, setDragOver] = useState(false)
   const [busy, run] = useBusy()
@@ -112,6 +114,12 @@ export default function Projects({ db, apply, goTo }: TabProps) {
     setLogs(await api.projectLogs(project.id))
   })
 
+  const runPreflight = () => project && run('preflight', async () => {
+    const env = await api.preflight(project.id)
+    apply(env)
+    setPreflight(env.result)
+  })
+
   const exportJson = () => project && run('json', async () => {
     const bundle = await api.projectBundle(project.id)
     downloadText(`${project.slug}.doing-mcp.json`, JSON.stringify(bundle, null, 2))
@@ -163,7 +171,7 @@ export default function Projects({ db, apply, goTo }: TabProps) {
         <EmptyState
           icon={Boxes}
           title="No MCP project"
-          desc="Create a project then drag your tools into it: DOINg.MCP generates a standalone FastMCP server, ready for Claude Desktop or any MCP client."
+          desc="Create a project then drag your tools into it: DOINg.MCP generates a standalone FastMCP server, ready for any MCP client."
           action={<Button icon={Plus} onClick={() => setCreateOpen(true)}>Create my first server</Button>}
         />
       ) : (
@@ -201,6 +209,7 @@ export default function Projects({ db, apply, goTo }: TabProps) {
                 actions={
                   <div className="flex flex-wrap gap-1.5">
                     <Button size="sm" icon={MessageSquare} onClick={() => setChatOpen(true)} disabled={project.tool_ids.length === 0}>Chat</Button>
+                    <Button size="sm" variant="outline" icon={ClipboardCheck} busy={busy === 'preflight'} onClick={runPreflight}>Preflight</Button>
                     <Button size="sm" variant="outline" icon={FileCode2} busy={busy === 'generate'} onClick={generate}>View code</Button>
                     <a href={api.exportUrl(project.id)} download>
                       <Button size="sm" variant="outline" icon={Download}>ZIP</Button>
@@ -223,7 +232,7 @@ export default function Projects({ db, apply, goTo }: TabProps) {
                       onBlur={(e) => { if (e.target.value !== project.description) run('desc', async () => apply(await api.updateProject(project.id, { description: e.target.value }))) }}
                     />
                   </Field>
-                  <Field label="Recommended transport" hint="stdio for Claude Desktop; the Run button always uses HTTP for local testing.">
+                  <Field label="Recommended transport" hint="stdio for MCP clients; the Run button always uses HTTP for local testing.">
                     <Select value={project.transport} onChange={(e) => run('transport', async () => apply(await api.updateProject(project.id, { transport: e.target.value })))}>
                       <option value="stdio">stdio</option>
                       <option value="http">http</option>
@@ -357,6 +366,42 @@ export default function Projects({ db, apply, goTo }: TabProps) {
       {/* ----- Logs modal ----- */}
       <Modal open={logs !== null} onClose={() => setLogs(null)} title="Server logs" wide>
         <CodeBlock code={logs ?? ''} filename="server.log" maxHeight="max-h-[60vh]" />
+      </Modal>
+
+      {/* ----- Preflight modal ----- */}
+      <Modal
+        open={preflight !== null}
+        onClose={() => setPreflight(null)}
+        title={
+          <span className="flex items-center gap-2">
+            Preflight — {project?.name}
+            {preflight && (
+              <Badge tone={preflight.ok ? 'green' : 'red'}>
+                {preflight.ok ? 'ready to ship' : 'blocked'}
+              </Badge>
+            )}
+          </span>
+        }
+        wide
+      >
+        {preflight && (
+          <div className="space-y-1.5">
+            {preflight.items.map((item, i) => (
+              <div key={i} className={cls(
+                'flex items-start gap-2 rounded-md px-2.5 py-1.5 text-xs',
+                item.level === 'pass' && 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300',
+                item.level === 'warn' && 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300',
+                item.level === 'fail' && 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300',
+              )}>
+                {item.level === 'pass' && <CheckCircle2 size={13} className="mt-0.5 shrink-0" />}
+                {item.level === 'warn' && <AlertTriangle size={13} className="mt-0.5 shrink-0" />}
+                {item.level === 'fail' && <XCircle size={13} className="mt-0.5 shrink-0" />}
+                <span className="font-medium">{item.label}</span>
+                <span className="text-[11px] opacity-80">{item.detail}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </Modal>
 
       {/* ----- Chat modal ----- */}

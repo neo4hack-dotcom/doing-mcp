@@ -2,7 +2,7 @@
 
 Produces a complete bundle: server.py (single-file, embedded guardrails, rate-limiting,
 PII masking, catalog exposed as an MCP resource), requirements.txt, README.md,
-.env.example, catalog.json, manifest.json and the Claude Desktop config snippet.
+.env.example, catalog.json, manifest.json and a generic MCP client config snippet.
 """
 import json
 import re
@@ -143,12 +143,66 @@ def _demo_db():
         return _CLIENTS["demo"]
 
 
+_NUM_RE = re.compile(r"-?\\d+(\\.\\d+)?")
+
+
+def _rls_coerce(value: str):
+    if _NUM_RE.fullmatch(value):
+        return float(value) if "." in value else int(value)
+    return value
+
+
+def _rls_apply(sql: str, kind: str, policy: dict, identity) -> tuple:
+    """Row-level security: wrap the query and filter projected columns for the caller.
+
+    Fail-closed: a caller matching no rule gets zero rows unless the policy's
+    default_visibility is "all". Values are bound as parameters.
+    """
+    ident = "" if identity is None else str(identity)
+    by_col: dict = {}
+    matched = False
+    for rule in policy.get("rules", []):
+        subjects = rule.get("subjects", [])
+        if "*" in subjects or ident in subjects:
+            matched = True
+            bucket = by_col.setdefault(rule["column"], [])
+            for val in rule.get("values", []):
+                if val not in bucket:
+                    bucket.append(val)
+    inner = sql.rstrip().rstrip(";")
+    if not matched:
+        if policy.get("default_visibility") != "all":
+            return ("SELECT * FROM (\\n" + inner + "\\n) doing_rls WHERE 1 = 0", {})
+        return (inner, {})
+    if not by_col:
+        return (inner, {})
+    conditions, params = [], {}
+    for i, col in enumerate(sorted(by_col)):
+        names = []
+        for j, val in enumerate(by_col[col]):
+            name = "rls_" + str(i) + "_" + str(j)
+            params[name] = _rls_coerce(val)
+            names.append(":" + name)
+        quoted = col.upper() if kind == "oracle" else '"' + col + '"'
+        conditions.append(quoted + " IN (" + ", ".join(names) + ")")
+    return ("SELECT * FROM (\\n" + inner + "\\n) doing_rls WHERE " + " AND ".join(conditions),
+            params)
+
+
 def _execute(conn_name: str, sql: str, params: dict, max_rows: int,
-             timeout_s: int, masked: list) -> dict:
+             timeout_s: int, masked: list, policy: dict | None = None,
+             identity=None) -> dict:
     cfg = CONNECTIONS[conn_name]
+    rls_params: dict = {}
+    if policy and policy.get("enabled") and policy.get("rules"):
+        if identity in (None, ""):
+            raise ValueError("Row-level security: the caller identity argument is required.")
+        sql, rls_params = _rls_apply(sql, cfg["kind"], policy, identity)
     _guard(sql)
     used = set(_PARAM_RE.findall(sql))
-    bind = {k: v for k, v in (params or {}).items() if k in used and v is not None}
+    merged = dict(params or {})
+    merged.update(rls_params)
+    bind = {k: v for k, v in merged.items() if k in used and v is not None}
     missing = [p for p in used if p not in bind]
     if missing:
         raise ValueError("Missing required parameters: " + ", ".join(sorted(missing)))
@@ -314,6 +368,7 @@ def generate_server_py(db: dict, project: dict) -> str:
     lines.append(embed("CATALOG", catalog))
 
     sql_map = {}
+    rls_map = {}
     used_names: set[str] = set()
     tool_blocks: list[str] = []
     for tool in tools:
@@ -324,11 +379,24 @@ def generate_server_py(db: dict, project: dict) -> str:
         conn = conns[tool["connection_id"]]
         sql_map[name] = tool["sql"]
         gr = tool.get("guardrails", {})
-        params = tool.get("params", [])
+        params = list(tool.get("params", []))
+        desc = (tool.get("description") or tool["name"]).strip()
+
+        policy = tool.get("row_policy") or {}
+        rls_on = bool(policy.get("enabled")) and bool(policy.get("rules"))
+        identity_arg = py_ident(policy.get("identity_arg") or "user_id") if rls_on else None
+        if rls_on:
+            rls_map[name] = {"enabled": True, "default_visibility": policy.get("default_visibility", "deny"),
+                             "rules": policy.get("rules", [])}
+            if identity_arg not in {py_ident(p["name"]) for p in params}:
+                params = [{"name": identity_arg, "type": "string",
+                           "description": "Caller identity (row-level access control).",
+                           "required": True, "default": None}] + params
+            desc += f" Requires `{identity_arg}` (caller identity): results are filtered by the row-level policy."
+
         signature = build_signature(params)
         arg_names = [py_ident(p["name"]) for p in params]
         params_dict = "{" + ", ".join(f'"{a}": {a}' for a in arg_names) + "}"
-        desc = (tool.get("description") or tool["name"]).strip()
 
         block = []
         block.append(f"@mcp.tool(name={json.dumps(name)}, description={json.dumps(desc, ensure_ascii=False)})")
@@ -336,10 +404,15 @@ def generate_server_py(db: dict, project: dict) -> str:
         block.append(f"    _rate({json.dumps(name)}, {int(gr.get('rate_per_min', 120))})")
         block.append(f"    return _execute({json.dumps(conn_key(conn))}, _SQL[{json.dumps(name)}], {params_dict},")
         block.append(f"                    max_rows={int(gr.get('max_rows', 500))}, timeout_s={int(gr.get('timeout_s', 30))},")
-        block.append(f"                    masked={json.dumps(gr.get('masked_columns', []), ensure_ascii=False)})")
+        block.append(f"                    masked={json.dumps(gr.get('masked_columns', []), ensure_ascii=False)},")
+        if rls_on:
+            block.append(f"                    policy=_RLS[{json.dumps(name)}], identity={identity_arg})")
+        else:
+            block.append("                    policy=None, identity=None)")
         tool_blocks.append("\n".join(block))
 
     lines.append(embed("_SQL", sql_map))
+    lines.append(embed("_RLS", rls_map))
 
     instructions = (project.get("description") or project["name"]) + \
         " — read-only data server. Use the doing://catalog resource " \
@@ -428,7 +501,8 @@ def generate_env_example(db: dict, project: dict) -> str:
     return "\n".join(lines)
 
 
-def claude_desktop_snippet(project: dict) -> str:
+def mcp_client_snippet(project: dict) -> str:
+    """Generic MCP client configuration (mcpServers schema) — works with any MCP client."""
     return json.dumps({
         "mcpServers": {
             project["slug"]: {
@@ -471,19 +545,19 @@ cp .env.example .env   # then fill in the passwords
 ## Running
 
 ```bash
-# stdio mode (Claude Desktop, MCP clients):
+# stdio mode (MCP clients):
 python server.py
 
 # HTTP mode (tests, integrations):
 MCP_TRANSPORT=http MCP_PORT={project.get('port') or 8900} python server.py
 ```
 
-## Connect to Claude Desktop
+## Connect to an MCP client
 
-Add to `claude_desktop_config.json` (adjust the path):
+Add to your MCP client configuration (the standard `mcpServers` schema, adjust the path):
 
 ```json
-{claude_desktop_snippet(project)}
+{mcp_client_snippet(project)}
 ```
 
 ## Embedded security
@@ -493,6 +567,8 @@ Add to `claude_desktop_config.json` (adjust the path):
 - **Row cap and timeout** per tool.
 - **Rate-limiting** per tool (calls/minute).
 - **PII masking**: configured sensitive columns are replaced with `***MASKED***`.
+- **Row-level security** (when configured): each call must carry the caller identity
+  argument; rows are filtered per caller according to the embedded policy (fail-closed).
 - **Zero secrets in the code**: credentials via environment variables only.
 
 ---
@@ -507,7 +583,7 @@ def generate_project_files(db: dict, project: dict) -> dict[str, str]:
         "README.md": generate_readme(db, project),
         ".env.example": generate_env_example(db, project),
         "catalog.json": json.dumps(project_catalog(db, project), ensure_ascii=False, indent=1),
-        "claude_desktop_config.example.json": claude_desktop_snippet(project),
+        "mcp_client_config.example.json": mcp_client_snippet(project),
         "manifest.json": json.dumps({
             "generator": "DOINg.MCP", "generated_at": storage.now_iso(),
             "project": {k: project.get(k) for k in

@@ -101,6 +101,23 @@ export interface SecurityReview {
   recommendations: string[]
 }
 
+export interface RowRule {
+  subjects: string[]
+  column: string
+  values: string[]
+}
+
+export interface RowPolicy {
+  enabled: boolean
+  identity_arg: string
+  default_visibility: 'deny' | 'all'
+  rules: RowRule[]
+}
+
+export const EMPTY_POLICY: RowPolicy = {
+  enabled: false, identity_arg: 'user_id', default_visibility: 'deny', rules: [],
+}
+
 export interface ToolDef {
   id: string
   name: string
@@ -110,6 +127,7 @@ export interface ToolDef {
   sql: string
   params: ToolParam[]
   guardrails: ToolGuardrails
+  row_policy?: RowPolicy
   tags: string[]
   enabled: boolean
   security_review?: SecurityReview | null
@@ -185,6 +203,44 @@ export interface Envelope<T = unknown> {
   version: number
   data: AppData
   result: T
+}
+
+export interface ColumnProfile {
+  name: string
+  type: string
+  nulls: number
+  null_pct: number
+  distinct: number | null
+  min: unknown
+  max: unknown
+  top: { value: unknown; count: number }[]
+}
+
+export interface TableProfile {
+  schema: string
+  table: string
+  row_count: number
+  columns: ColumnProfile[]
+}
+
+export interface PreflightItem {
+  level: 'pass' | 'warn' | 'fail'
+  label: string
+  detail: string
+}
+
+export interface PreflightReport {
+  ok: boolean
+  items: PreflightItem[]
+}
+
+export interface MagicResult {
+  id: string
+  name: string
+  sql: string
+  explanation: string
+  validation: Validation
+  test: RunOutcome | null
 }
 
 export interface ChatStep {
