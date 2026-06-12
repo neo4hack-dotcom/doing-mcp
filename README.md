@@ -38,6 +38,22 @@ npm run dev
 **No database at hand?** Click “Demo sandbox”: an in-memory SQLite database
 (5 filled e-commerce tables) lets you run the whole pipeline.
 
+### Production (single origin)
+
+Build the frontend once, then let the backend serve it — everything on port 3001,
+no separate web server, no CORS:
+
+```bash
+cd frontend && npm install && npm run build      # produces frontend/dist
+cd ../backend && uvicorn main:app --port 3001    # serves the API *and* the SPA
+# open http://localhost:3001
+```
+
+The backend auto-detects `frontend/dist` (override with `DOING_MCP_DIST=/path/to/dist`)
+and serves `index.html` + hashed assets, while `/api/*` always keeps priority and
+unknown API paths still return 404. When `dist` is absent (dev), the API runs alone
+and the Vite dev server on :3000 proxies `/api` to it.
+
 **Local LLM**: Settings tab → Ollama / LM Studio / vLLM / llama.cpp presets,
 connection test, model listing, temperature.
 

@@ -8,11 +8,22 @@ Conventions:
 """
 import contextlib
 import io
+import os
 import zipfile
 
 from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse, JSONResponse, PlainTextResponse, StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
+
+# Production: the backend can serve the built SPA (frontend/dist). In dev the
+# frontend runs on Vite (:3000) and proxies /api here, so dist is usually absent.
+DIST_DIR = os.environ.get(
+    "DOING_MCP_DIST",
+    os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")),
+)
 
 import chat as chat_mod
 import codegen
@@ -1095,6 +1106,37 @@ def clear_audit(x_base_version: str | None = Header(None, alias="X-Base-Version"
 @app.on_event("shutdown")
 def shutdown():
     runner.stop_all()
+
+
+# ---------------------------------------------------------------- Static SPA
+# Registered LAST so every /api/* route above keeps priority. Only mounted when
+# a build exists, so the API still runs without a compiled frontend.
+
+def _mount_frontend() -> None:
+    if not os.path.isfile(os.path.join(DIST_DIR, "index.html")):
+        return
+    assets_dir = os.path.join(DIST_DIR, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def _spa_root():
+        return FileResponse(os.path.join(DIST_DIR, "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def _spa_catch_all(full_path: str):
+        # Never let the SPA fallback swallow unknown API calls.
+        if full_path.startswith("api/"):
+            raise HTTPException(404, "Not found.")
+        candidate = os.path.normpath(os.path.join(DIST_DIR, full_path))
+        # Stay inside DIST_DIR (defense against path traversal), then fall back
+        # to index.html for client-side paths.
+        if candidate.startswith(DIST_DIR) and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        return FileResponse(os.path.join(DIST_DIR, "index.html"))
+
+
+_mount_frontend()
 
 
 if __name__ == "__main__":
