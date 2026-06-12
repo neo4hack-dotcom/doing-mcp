@@ -1,16 +1,53 @@
-// Explorer tab: data catalog, AI enrichment (descriptions + PII), previews.
-import { BookOpen, Eye, RefreshCw, Sparkles } from 'lucide-react'
+// Explorer tab: data catalog, AI enrichment (descriptions + PII), previews,
+// column profiling, join-key detection and one-click starter tools.
+import { BarChart3, BookOpen, Eye, Hammer, Link2, RefreshCw, Sparkles } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { api } from '../api'
 import { ResultsTable, SchemaTree, tableKey } from '../components/data'
-import { Badge, Button, Card, EmptyState, Select, useBusy, useToast } from '../components/ui'
-import type { RunOutcome, TableInfo } from '../types'
+import { Badge, Button, Card, EmptyState, Select, cls, useBusy, useToast } from '../components/ui'
+import type { RunOutcome, TableInfo, TableProfile } from '../types'
 import type { TabProps } from './shared'
+
+const SCAFFOLD_KINDS = [
+  { id: 'list', label: 'list — browse rows' },
+  { id: 'get_by_id', label: 'get_by_id — lookup by key' },
+  { id: 'count_by', label: 'count_by — group & count' },
+  { id: 'search', label: 'search — LIKE pattern' },
+]
+
+/** Heuristic join-key detection: table_id ↔ table.id, shared *_id columns. */
+function relatedTables(target: TableInfo, all: TableInfo[]): { table: TableInfo; via: string }[] {
+  const out: { table: TableInfo; via: string }[] = []
+  const targetCols = new Set(target.columns.map((c) => c.name.toLowerCase()))
+  const singular = (s: string) => (s.endsWith('s') ? s.slice(0, -1) : s)
+  for (const other of all) {
+    if (other === target) continue
+    const otherCols = new Set(other.columns.map((c) => c.name.toLowerCase()))
+    const links = new Set<string>()
+    const fkToOther = `${singular(other.name.toLowerCase())}_id`
+    if (targetCols.has(fkToOther) && (otherCols.has('id') || otherCols.has(fkToOther))) {
+      links.add(`${target.name}.${fkToOther} → ${other.name}.id`)
+    }
+    const fkToTarget = `${singular(target.name.toLowerCase())}_id`
+    if (otherCols.has(fkToTarget) && (targetCols.has('id') || targetCols.has(fkToTarget))) {
+      links.add(`${other.name}.${fkToTarget} → ${target.name}.id`)
+    }
+    for (const col of targetCols) {
+      if (col !== 'id' && col.endsWith('_id') && otherCols.has(col)) {
+        links.add(`shared key ${col}`)
+      }
+    }
+    if (links.size > 0) out.push({ table: other, via: [...links][0] })
+  }
+  return out.slice(0, 6)
+}
 
 export default function Catalog({ db, apply, goTo }: TabProps) {
   const [connId, setConnId] = useState(() => db.connections[0]?.id ?? '')
   const [selected, setSelected] = useState<string | null>(null)
   const [preview, setPreview] = useState<RunOutcome | null>(null)
+  const [profile, setProfile] = useState<TableProfile | null>(null)
+  const [scaffoldKinds, setScaffoldKinds] = useState<string[]>(SCAFFOLD_KINDS.map((k) => k.id))
   const [busy, run] = useBusy()
   const toast = useToast()
 
@@ -19,6 +56,10 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
   const table: TableInfo | undefined = useMemo(
     () => catalog?.tables.find((t) => tableKey(t) === selected),
     [catalog, selected],
+  )
+  const related = useMemo(
+    () => (table && catalog ? relatedTables(table, catalog.tables) : []),
+    [table, catalog],
   )
 
   if (db.connections.length === 0) {
@@ -50,6 +91,20 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
     setPreview(env.result)
   })
 
+  const loadProfile = () => conn && table && run('profile', async () => {
+    const env = await api.profileTable(conn.id, table.schema, table.name)
+    apply(env)
+    if (!env.result.ok) { toast.push(env.result.error ?? 'Profiling failed.', 'error'); return }
+    setProfile(env.result.profile ?? null)
+  })
+
+  const scaffold = () => conn && table && run('scaffold', async () => {
+    const env = await api.scaffoldTools(conn.id, table.schema, table.name, scaffoldKinds)
+    apply(env)
+    toast.push(`${env.result.created.length} starter tool(s) created: ${env.result.created.join(', ')}.`, 'success')
+    goTo('tools')
+  })
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -60,7 +115,7 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Select value={conn?.id ?? ''} onChange={(e) => { setConnId(e.target.value); setSelected(null); setPreview(null) }} className="w-56">
+          <Select value={conn?.id ?? ''} onChange={(e) => { setConnId(e.target.value); setSelected(null); setPreview(null); setProfile(null) }} className="w-56">
             {db.connections.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </Select>
           <Button variant="outline" icon={RefreshCw} busy={busy === 'introspect'} onClick={introspect}>Introspect</Button>
@@ -82,7 +137,7 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
           <SchemaTree
             catalog={catalog}
             selectedKey={selected ?? undefined}
-            onPickTable={(t) => { setSelected(tableKey(t)); setPreview(null) }}
+            onPickTable={(t) => { setSelected(tableKey(t)); setPreview(null); setProfile(null) }}
           />
         </Card>
 
@@ -96,6 +151,9 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
                   <>
                     <Button size="sm" variant="outline" icon={Sparkles} busy={busy === 'enrich'} onClick={() => enrich([tableKey(table)])}>
                       Document this table
+                    </Button>
+                    <Button size="sm" variant="outline" icon={BarChart3} busy={busy === 'profile'} onClick={loadProfile}>
+                      Profile
                     </Button>
                     <Button size="sm" variant="outline" icon={Eye} busy={busy === 'preview'} onClick={loadPreview}>
                       Preview (50 rows)
@@ -132,6 +190,90 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
                   Columns flagged <Badge tone="red">PII</Badge> are offered for automatic masking when creating tools.
                 </p>
               </Card>
+
+              {profile && profile.table === table.name && (
+                <Card
+                  title="Column profile"
+                  subtitle={`${profile.row_count.toLocaleString('en-US')} rows — null rates, cardinality, ranges and top values (handy for RLS rules).`}
+                >
+                  <div className="max-h-96 overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-700">
+                    <table className="w-full text-left text-xs">
+                      <thead className="sticky top-0 bg-zinc-50 dark:bg-zinc-800">
+                        <tr>
+                          {['Column', 'Nulls', 'Distinct', 'Min', 'Max', 'Top values'].map((h) => (
+                            <th key={h} className="whitespace-nowrap px-2.5 py-1.5 font-semibold text-zinc-600 dark:text-zinc-300">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {profile.columns.map((col) => (
+                          <tr key={col.name} className="border-t border-zinc-100 align-top dark:border-zinc-800">
+                            <td className="whitespace-nowrap px-2.5 py-1.5 font-mono text-[11px] font-medium">{col.name}</td>
+                            <td className={cls('whitespace-nowrap px-2.5 py-1.5 text-[11px]', col.null_pct > 20 ? 'text-amber-600' : 'text-zinc-500')}>
+                              {col.null_pct}%
+                            </td>
+                            <td className="whitespace-nowrap px-2.5 py-1.5 font-mono text-[11px] text-zinc-500">{col.distinct ?? '—'}</td>
+                            <td className="max-w-[110px] truncate px-2.5 py-1.5 font-mono text-[11px] text-zinc-500">{col.min === null ? '—' : String(col.min)}</td>
+                            <td className="max-w-[110px] truncate px-2.5 py-1.5 font-mono text-[11px] text-zinc-500">{col.max === null ? '—' : String(col.max)}</td>
+                            <td className="px-2.5 py-1.5">
+                              <div className="flex flex-wrap gap-1">
+                                {col.top.map((t, i) => (
+                                  <Badge key={i} tone="gray" className="font-mono">
+                                    {String(t.value).slice(0, 18)} <span className="opacity-60">×{t.count}</span>
+                                  </Badge>
+                                ))}
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+              )}
+
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                <Card title="Related tables" subtitle="Probable join keys detected from column names.">
+                  {related.length === 0 ? (
+                    <p className="text-xs text-zinc-400">No probable join detected.</p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {related.map(({ table: other, via }) => (
+                        <button
+                          key={tableKey(other)}
+                          onClick={() => { setSelected(tableKey(other)); setPreview(null); setProfile(null) }}
+                          className="flex w-full items-center gap-2 rounded-lg border border-zinc-200 px-2.5 py-1.5 text-left text-xs hover:border-brand-300 dark:border-zinc-700"
+                        >
+                          <Link2 size={12} className="shrink-0 text-brand-500" />
+                          <span className="font-mono font-medium">{other.name}</span>
+                          <span className="ml-auto truncate font-mono text-[10px] text-zinc-400">{via}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </Card>
+                <Card title="Starter tools" subtitle="Instant, deterministic MCP tools for this table — no LLM needed.">
+                  <div className="space-y-1.5">
+                    {SCAFFOLD_KINDS.map((kind) => (
+                      <label key={kind.id} className="flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+                        <input
+                          type="checkbox"
+                          checked={scaffoldKinds.includes(kind.id)}
+                          onChange={(e) => setScaffoldKinds((prev) =>
+                            e.target.checked ? [...prev, kind.id] : prev.filter((k) => k !== kind.id))}
+                          className="accent-brand-600"
+                        />
+                        <span className="font-mono">{kind.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                  <Button size="sm" icon={Hammer} className="mt-3" busy={busy === 'scaffold'}
+                    onClick={scaffold} disabled={scaffoldKinds.length === 0}>
+                    Generate {scaffoldKinds.length} tool{scaffoldKinds.length > 1 ? 's' : ''}
+                  </Button>
+                </Card>
+              </div>
+
               {preview && (
                 <Card title="Data preview">
                   <ResultsTable outcome={preview} />

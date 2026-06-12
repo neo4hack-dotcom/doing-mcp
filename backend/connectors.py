@@ -299,6 +299,77 @@ def preview(conn: dict, schema: str, table: str, limit: int = 50) -> dict:
     return execute(conn, sql, {}, max_rows=limit, timeout_s=20)
 
 
+_NO_AGG_TYPES = ("LOB", "BLOB", "CLOB", "JSON", "XML", "ARRAY", "MAP", "TUPLE", "NESTED",
+                 "AGGREGATEFUNCTION", "LONG", "RAW", "BFILE")
+
+
+def _table_ref(conn: dict, schema: str, table: str) -> str:
+    if conn.get("kind") == "demo":
+        return f'"{table}"'
+    return f'"{schema}"."{table}"'
+
+
+def profile_table(conn: dict, schema: str, table: str,
+                  max_cols: int = 25, top_cols: int = 8) -> dict:
+    """Column-level profiling: nulls, distinct counts, min/max, top values.
+
+    Identifiers are validated against the live introspection (never user-built),
+    so the interpolated quoting below is safe.
+    """
+    known = {(t["schema"], t["name"]) for t in list_tables(conn)}
+    if (schema, table) not in known:
+        raise RuntimeError(f"Unknown table: {schema}.{table}")
+    columns = list_columns(conn, schema, table)[:max_cols]
+    if not columns:
+        raise RuntimeError("No columns found for this table.")
+    kind = conn.get("kind")
+    ref = _table_ref(conn, schema, table)
+
+    def aggregatable(col: dict) -> bool:
+        ctype = (col.get("type") or "").upper()
+        return not any(bad in ctype for bad in _NO_AGG_TYPES)
+
+    parts = ["COUNT(*)"]
+    for col in columns:
+        qc = f'"{col["name"]}"'
+        if aggregatable(col):
+            parts += [f"COUNT({qc})", f"COUNT(DISTINCT {qc})", f"MIN({qc})", f"MAX({qc})"]
+        else:
+            parts += [f"COUNT({qc})", "NULL", "NULL", "NULL"]
+    row = execute(conn, f"SELECT {', '.join(parts)} FROM {ref}",
+                  {}, max_rows=1, timeout_s=60)["rows"][0]
+
+    total = row[0] or 0
+    out_cols = []
+    for i, col in enumerate(columns):
+        non_null, distinct, mn, mx = row[1 + i * 4: 5 + i * 4]
+        out_cols.append({
+            "name": col["name"], "type": col.get("type", ""),
+            "nulls": (total - (non_null or 0)) if total else 0,
+            "null_pct": round(100 * (total - (non_null or 0)) / total, 1) if total else 0,
+            "distinct": distinct, "min": mn, "max": mx, "top": [],
+        })
+
+    # Top values for the first few aggregatable columns (small per-column queries).
+    profiled = 0
+    for entry, col in zip(out_cols, columns):
+        if profiled >= top_cols or not aggregatable(col):
+            continue
+        qc = f'"{col["name"]}"'
+        limit = "FETCH FIRST 5 ROWS ONLY" if kind == "oracle" else "LIMIT 5"
+        try:
+            top = execute(conn,
+                          f"SELECT {qc}, COUNT(*) FROM {ref} WHERE {qc} IS NOT NULL "
+                          f"GROUP BY {qc} ORDER BY COUNT(*) DESC {limit}",
+                          {}, max_rows=5, timeout_s=30)
+            entry["top"] = [{"value": r[0], "count": r[1]} for r in top["rows"]]
+            profiled += 1
+        except Exception:  # noqa: BLE001 — profiling is best-effort per column
+            continue
+
+    return {"schema": schema, "table": table, "row_count": total, "columns": out_cols}
+
+
 def execute(conn: dict, sql: str, params: dict, max_rows: int = 500, timeout_s: int = 30) -> dict:
     """Execute a SELECT already validated by the guardrails. Returns JSON-safe columns + rows."""
     kind = conn.get("kind")
