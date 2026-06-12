@@ -2,11 +2,11 @@
 // parameter inputs, guardrail report, risk badge.
 import {
   AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database,
-  GripVertical, Search, ShieldAlert, Table2, XCircle,
+  GripVertical, Pin, Search, ShieldAlert, Star, Table2, X, XCircle,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import type { DragEvent } from 'react'
-import type { Catalog, RunOutcome, TableInfo, ToolParam, Validation } from '../types'
+import type { Catalog, ColumnInfo, RunOutcome, TableInfo, ToolParam, Validation } from '../types'
 import { Badge, Input, cls } from './ui'
 
 // ---------------------------------------------------------------- Results
@@ -71,19 +71,27 @@ export function tableKey(t: TableInfo): string {
   return `${t.schema}.${t.name}`
 }
 
-export function SchemaTree({ catalog, onPickTable, selectedKey, draggable }: {
+export function columnPinKey(t: TableInfo, c: ColumnInfo): string {
+  return `${t.schema}.${t.name}.${c.name}`
+}
+
+export function SchemaTree({ catalog, onPickTable, selectedKey, draggable, pins, onTogglePin }: {
   catalog: Catalog | undefined
   onPickTable?: (table: TableInfo) => void
   selectedKey?: string
   draggable?: boolean
+  pins?: string[]
+  onTogglePin?: (key: string) => void
 }) {
   const [filter, setFilter] = useState('')
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
+  const needle = filter.trim().toLowerCase()
   const groups = useMemo(() => {
     const tables = (catalog?.tables ?? []).filter((t) =>
-      !filter || tableKey(t).toLowerCase().includes(filter.toLowerCase())
-      || t.columns.some((c) => c.name.toLowerCase().includes(filter.toLowerCase())))
+      !needle || tableKey(t).toLowerCase().includes(needle)
+      || t.columns.some((c) => c.name.toLowerCase().includes(needle)))
     const map = new Map<string, TableInfo[]>()
     for (const table of tables) {
       const list = map.get(table.schema) ?? []
@@ -91,11 +99,17 @@ export function SchemaTree({ catalog, onPickTable, selectedKey, draggable }: {
       map.set(table.schema, list)
     }
     return [...map.entries()]
-  }, [catalog, filter])
+  }, [catalog, needle])
 
-  const startDrag = (e: DragEvent, table: TableInfo) => {
+  const startTableDrag = (e: DragEvent, table: TableInfo) => {
     e.dataTransfer.setData('application/x-doing-table', JSON.stringify({ schema: table.schema, name: table.name }))
     e.dataTransfer.setData('text/plain', table.schema === 'demo' ? table.name : `${table.schema}.${table.name}`)
+    e.dataTransfer.effectAllowed = 'copy'
+  }
+
+  const startColumnDrag = (e: DragEvent, column: ColumnInfo) => {
+    e.stopPropagation()
+    e.dataTransfer.setData('text/plain', column.name)
     e.dataTransfer.effectAllowed = 'copy'
   }
 
@@ -111,7 +125,7 @@ export function SchemaTree({ catalog, onPickTable, selectedKey, draggable }: {
     <div className="space-y-2">
       <div className="relative">
         <Search size={13} className="absolute left-2.5 top-2.5 text-zinc-400" />
-        <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter tables and columns…" className="pl-8 !py-1.5 text-xs" />
+        <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Search tables and fields…" className="pl-8 !py-1.5 text-xs" />
       </div>
       <div className="max-h-[420px] space-y-1 overflow-y-auto pr-1">
         {groups.map(([schema, tables]) => (
@@ -127,25 +141,69 @@ export function SchemaTree({ catalog, onPickTable, selectedKey, draggable }: {
             </button>
             {!collapsed[schema] && tables.map((table) => {
               const key = tableKey(table)
+              const columnsMatch = Boolean(needle)
+                && table.columns.some((c) => c.name.toLowerCase().includes(needle))
+                && !key.toLowerCase().includes(needle)
+              const isOpen = expanded[key] || columnsMatch
+              const visibleColumns = columnsMatch
+                ? table.columns.filter((c) => c.name.toLowerCase().includes(needle))
+                : table.columns
               return (
-                <div
-                  key={key}
-                  draggable={draggable}
-                  onDragStart={(e) => startDrag(e, table)}
-                  onClick={() => onPickTable?.(table)}
-                  className={cls(
-                    'group ml-4 flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-xs',
-                    selectedKey === key
-                      ? 'bg-brand-50 text-brand-700 dark:bg-brand-900/30 dark:text-brand-300'
-                      : 'text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800',
-                  )}
-                >
-                  {draggable && <GripVertical size={11} className="text-zinc-300 group-hover:text-zinc-400" />}
-                  <Table2 size={12} className="shrink-0 text-zinc-400" />
-                  <span className="truncate font-medium">{table.name}</span>
-                  {typeof table.rows === 'number' && (
-                    <span className="ml-auto shrink-0 text-[10px] text-zinc-400">{formatRows(table.rows)}</span>
-                  )}
+                <div key={key}>
+                  <div
+                    draggable={draggable}
+                    onDragStart={(e) => startTableDrag(e, table)}
+                    onClick={() => onPickTable?.(table)}
+                    className={cls(
+                      'group ml-4 flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-xs',
+                      selectedKey === key
+                        ? 'bg-brand-50 text-brand-700 dark:bg-brand-900/30 dark:text-brand-300'
+                        : 'text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800',
+                    )}
+                  >
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setExpanded((prev) => ({ ...prev, [key]: !isOpen })) }}
+                      className="shrink-0 text-zinc-400 hover:text-zinc-600"
+                      title={isOpen ? 'Hide fields' : 'Show fields'}
+                    >
+                      {isOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                    </button>
+                    {draggable && <GripVertical size={11} className="text-zinc-300 group-hover:text-zinc-400" />}
+                    <Table2 size={12} className="shrink-0 text-zinc-400" />
+                    <span className="truncate font-medium">{table.name}</span>
+                    {typeof table.rows === 'number' && (
+                      <span className="ml-auto shrink-0 text-[10px] text-zinc-400">{formatRows(table.rows)}</span>
+                    )}
+                  </div>
+                  {isOpen && visibleColumns.map((column) => {
+                    const colPin = columnPinKey(table, column)
+                    const pinned = pins?.includes(colPin)
+                    return (
+                      <div
+                        key={column.name}
+                        draggable
+                        onDragStart={(e) => startColumnDrag(e, column)}
+                        className="group/col ml-12 flex cursor-grab items-center gap-1.5 rounded px-2 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-50 active:cursor-grabbing dark:text-zinc-400 dark:hover:bg-zinc-800/60"
+                        title={`${column.name} · ${column.type} — drag into the SQL editor`}
+                      >
+                        <span className={cls('truncate font-mono', pinned && 'text-amber-600 dark:text-amber-400')}>
+                          {column.name}
+                        </span>
+                        <span className="shrink-0 text-[9.5px] text-zinc-400/70">{column.type}</span>
+                        {column.pii && <Badge tone="red" className="!px-1 !text-[9px]">PII</Badge>}
+                        {onTogglePin && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); onTogglePin(colPin) }}
+                            className={cls('ml-auto shrink-0',
+                              pinned ? 'text-amber-500' : 'text-zinc-300 opacity-0 hover:text-amber-500 group-hover/col:opacity-100')}
+                            title={pinned ? 'Unpin field' : 'Pin field (kept across Explorer & SQL Studio)'}
+                          >
+                            <Star size={11} fill={pinned ? 'currentColor' : 'none'} />
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               )
             })}
@@ -153,6 +211,49 @@ export function SchemaTree({ catalog, onPickTable, selectedKey, draggable }: {
         ))}
         {groups.length === 0 && <p className="py-2 text-center text-xs text-zinc-400">No results.</p>}
       </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------- Pinned fields
+
+export function PinnedFields({ pins, onTogglePin, onInsert }: {
+  pins: string[]
+  onTogglePin: (key: string) => void
+  onInsert?: (text: string) => void
+}) {
+  if (pins.length === 0) return null
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50/50 px-2.5 py-2 dark:border-amber-900/50 dark:bg-amber-950/20">
+      <Pin size={12} className="shrink-0 text-amber-500" />
+      {pins.map((key) => {
+        const parts = key.split('.')
+        const column = parts[parts.length - 1]
+        const table = parts.length >= 2 ? parts[parts.length - 2] : ''
+        return (
+          <span
+            key={key}
+            draggable
+            onDragStart={(e) => { e.dataTransfer.setData('text/plain', column); e.dataTransfer.effectAllowed = 'copy' }}
+            onClick={() => onInsert?.(column)}
+            title={`${key}${onInsert ? ' — click or drag to insert' : ''}`}
+            className={cls(
+              'group inline-flex cursor-grab items-center gap-1 rounded-md border border-amber-300 bg-white px-1.5 py-0.5 font-mono text-[11px] text-amber-700 active:cursor-grabbing dark:border-amber-800 dark:bg-zinc-900 dark:text-amber-300',
+              onInsert && 'hover:border-amber-400 hover:bg-amber-100 dark:hover:bg-amber-950/40',
+            )}
+          >
+            {column}
+            <span className="text-[9px] text-amber-400">{table}</span>
+            <button
+              onClick={(e) => { e.stopPropagation(); onTogglePin(key) }}
+              className="text-amber-300 hover:text-red-500"
+              title="Unpin"
+            >
+              <X size={10} />
+            </button>
+          </span>
+        )
+      })}
     </div>
   )
 }

@@ -106,6 +106,16 @@ are contacted. The LLM must support OpenAI tool/function calling (most do via Ol
 27. **Magic tool**: describe the tool in plain language — the local LLM writes the SQL, validates it against the guardrails (with one auto-repair attempt), names it, documents the contract and creates it.
 28. **Project preflight**: a pre-ship checklist — guardrails per tool, contract/SQL parameter coherence, RLS policy sanity, live connection tests — with pass/warn/fail verdicts.
 
+## Data exploration (Metabase-style)
+
+The Explorer is built to roam your data without friction:
+
+- **Searchable schema tree** — search matches table *and* field names; matching fields auto-expand. Every field is draggable into the SQL editor, and ★ pins it.
+- **Pinned fields** — pin the columns you care about; they show as a chip bar in both the Explorer and the SQL Studio, and drop into your query with a click or a drag (no more hunting for column names).
+- **Data browser** — a large, closable popup with per-column filters (contains, =, ≠, >, ≥, <, ≤, starts with, is empty/not empty), click-to-sort headers, adjustable row limit and CSV export. Whitelisted operators with server-side bound parameters — injection-proof.
+- **Open in SQL Studio** — seed the editor from the current table (pinned fields first). Your SQL/prompt **draft survives tab switches**, so you can pop back to the Explorer to check a value and return without losing your work. ⌘/Ctrl + Enter runs the query.
+- The active connection is remembered across Explorer ↔ SQL Studio.
+
 ## Row-level security (RLS)
 
 Each tool can carry a *row policy*: an *identity argument* (default `user_id`) is added to the

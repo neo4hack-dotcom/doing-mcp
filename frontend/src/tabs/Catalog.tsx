@@ -1,12 +1,18 @@
 // Explorer tab: data catalog, AI enrichment (descriptions + PII), previews,
-// column profiling, join-key detection and one-click starter tools.
-import { BarChart3, BookOpen, Eye, Hammer, Link2, RefreshCw, Sparkles } from 'lucide-react'
+// column profiling, join-key detection, one-click starter tools, pinned fields
+// and a Metabase-style popup data browser.
+import {
+  BarChart3, BookOpen, Eye, Hammer, Link2, Maximize2, RefreshCw, SquareTerminal,
+  Sparkles, Star,
+} from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { api } from '../api'
-import { ResultsTable, SchemaTree, tableKey } from '../components/data'
+import DataBrowser from '../components/DataBrowser'
+import { PinnedFields, ResultsTable, SchemaTree, columnPinKey, tableKey } from '../components/data'
 import { Badge, Button, Card, EmptyState, Select, cls, useBusy, useToast } from '../components/ui'
 import type { RunOutcome, TableInfo, TableProfile } from '../types'
 import type { TabProps } from './shared'
+import { rememberConn, rememberedConn } from './shared'
 
 const SCAFFOLD_KINDS = [
   { id: 'list', label: 'list — browse rows' },
@@ -42,11 +48,12 @@ function relatedTables(target: TableInfo, all: TableInfo[]): { table: TableInfo;
   return out.slice(0, 6)
 }
 
-export default function Catalog({ db, apply, goTo }: TabProps) {
-  const [connId, setConnId] = useState(() => db.connections[0]?.id ?? '')
+export default function Catalog({ db, apply, goTo, pins, togglePin }: TabProps) {
+  const [connId, setConnId] = useState(() => rememberedConn(db))
   const [selected, setSelected] = useState<string | null>(null)
   const [preview, setPreview] = useState<RunOutcome | null>(null)
   const [profile, setProfile] = useState<TableProfile | null>(null)
+  const [browserOpen, setBrowserOpen] = useState(false)
   const [scaffoldKinds, setScaffoldKinds] = useState<string[]>(SCAFFOLD_KINDS.map((k) => k.id))
   const [busy, run] = useBusy()
   const toast = useToast()
@@ -82,7 +89,12 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
   const enrich = (keys?: string[]) => conn && run('enrich', async () => {
     const env = await api.enrich(conn.id, keys)
     apply(env)
-    toast.push(`${env.result.enriched} table(s) documented by the LLM (descriptions + PII detection).`, 'success')
+    const failed = env.result.failed ?? []
+    if (failed.length > 0) {
+      toast.push(`${env.result.enriched} table(s) documented — ${failed.length} skipped (LLM JSON issues): ${failed.join(', ')}. Re-run to retry.`, 'warn')
+    } else {
+      toast.push(`${env.result.enriched} table(s) documented by the LLM (descriptions + PII detection).`, 'success')
+    }
   })
 
   const loadPreview = () => conn && table && run('preview', async () => {
@@ -105,6 +117,17 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
     goTo('tools')
   })
 
+  const openInStudio = () => {
+    if (!conn || !table) return
+    const pinned = table.columns.filter((c) => pins.includes(columnPinKey(table, c)))
+    const cols = (pinned.length > 0 ? pinned : table.columns.slice(0, 8))
+      .map((c) => `"${c.name}"`).join(', ')
+    const ref = conn.kind === 'demo' ? `"${table.name}"` : `"${table.schema}"."${table.name}"`
+    localStorage.setItem('doing.studio.sql', `SELECT ${cols}\nFROM ${ref}`)
+    rememberConn(conn.id)
+    goTo('studio')
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -115,7 +138,7 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Select value={conn?.id ?? ''} onChange={(e) => { setConnId(e.target.value); setSelected(null); setPreview(null); setProfile(null) }} className="w-56">
+          <Select value={conn?.id ?? ''} onChange={(e) => { setConnId(e.target.value); rememberConn(e.target.value); setSelected(null); setPreview(null); setProfile(null) }} className="w-56">
             {db.connections.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </Select>
           <Button variant="outline" icon={RefreshCw} busy={busy === 'introspect'} onClick={introspect}>Introspect</Button>
@@ -132,12 +155,16 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
         </p>
       )}
 
+      <PinnedFields pins={pins} onTogglePin={togglePin} />
+
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Card title={`Tables (${catalog?.tables.length ?? 0})`} className="lg:col-span-1">
           <SchemaTree
             catalog={catalog}
             selectedKey={selected ?? undefined}
             onPickTable={(t) => { setSelected(tableKey(t)); setPreview(null); setProfile(null) }}
+            pins={pins}
+            onTogglePin={togglePin}
           />
         </Card>
 
@@ -149,14 +176,21 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
                 subtitle={table.description || table.comment || 'No description yet — run the AI documentation.'}
                 actions={
                   <>
+                    <Button size="sm" icon={Maximize2} onClick={() => setBrowserOpen(true)}>
+                      Browse & filter
+                    </Button>
+                    <Button size="sm" variant="outline" icon={SquareTerminal} onClick={openInStudio}
+                      title="Seed the SQL Studio with this table (pinned fields first)">
+                      Open in SQL Studio
+                    </Button>
                     <Button size="sm" variant="outline" icon={Sparkles} busy={busy === 'enrich'} onClick={() => enrich([tableKey(table)])}>
-                      Document this table
+                      Document
                     </Button>
                     <Button size="sm" variant="outline" icon={BarChart3} busy={busy === 'profile'} onClick={loadProfile}>
                       Profile
                     </Button>
                     <Button size="sm" variant="outline" icon={Eye} busy={busy === 'preview'} onClick={loadPreview}>
-                      Preview (50 rows)
+                      Preview
                     </Button>
                   </>
                 }
@@ -165,15 +199,33 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
                   <table className="w-full text-left text-xs">
                     <thead className="sticky top-0 bg-zinc-50 dark:bg-zinc-800">
                       <tr>
+                        <th className="w-7 px-2 py-1.5" title="Pin fields to reuse them in the SQL Studio" />
                         <th className="px-2.5 py-1.5 font-semibold text-zinc-600 dark:text-zinc-300">Column</th>
                         <th className="px-2.5 py-1.5 font-semibold text-zinc-600 dark:text-zinc-300">Type</th>
                         <th className="px-2.5 py-1.5 font-semibold text-zinc-600 dark:text-zinc-300">Description (AI)</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {table.columns.map((col) => (
-                        <tr key={col.name} className="border-t border-zinc-100 dark:border-zinc-800">
-                          <td className="whitespace-nowrap px-2.5 py-1.5 font-mono text-[11px] font-medium">
+                      {table.columns.map((col) => {
+                        const pinKey = columnPinKey(table, col)
+                        const pinned = pins.includes(pinKey)
+                        return (
+                        <tr key={col.name} className="group border-t border-zinc-100 dark:border-zinc-800">
+                          <td className="px-2 py-1.5">
+                            <button
+                              onClick={() => togglePin(pinKey)}
+                              className={cls(pinned ? 'text-amber-500' : 'text-zinc-300 opacity-0 hover:text-amber-500 group-hover:opacity-100')}
+                              title={pinned ? 'Unpin field' : 'Pin field — drag it into your SQL later'}
+                            >
+                              <Star size={12} fill={pinned ? 'currentColor' : 'none'} />
+                            </button>
+                          </td>
+                          <td
+                            draggable
+                            onDragStart={(e) => { e.dataTransfer.setData('text/plain', col.name); e.dataTransfer.effectAllowed = 'copy' }}
+                            className="cursor-grab whitespace-nowrap px-2.5 py-1.5 font-mono text-[11px] font-medium active:cursor-grabbing"
+                            title="Drag into the SQL editor"
+                          >
                             {col.name}
                             {col.pii && <Badge tone="red" className="ml-1.5">PII</Badge>}
                           </td>
@@ -182,7 +234,8 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
                             {col.description || col.comment || <span className="italic text-zinc-400">—</span>}
                           </td>
                         </tr>
-                      ))}
+                        )
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -275,7 +328,15 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
               </div>
 
               {preview && (
-                <Card title="Data preview">
+                <Card
+                  title="Data preview"
+                  actions={
+                    <Button size="sm" variant="ghost" icon={Maximize2} onClick={() => setBrowserOpen(true)}
+                      title="Enlarge: full browser with filters and sorting">
+                      Enlarge
+                    </Button>
+                  }
+                >
                   <ResultsTable outcome={preview} />
                 </Card>
               )}
@@ -289,6 +350,15 @@ export default function Catalog({ db, apply, goTo }: TabProps) {
           )}
         </div>
       </div>
+
+      {conn && table && (
+        <DataBrowser
+          open={browserOpen}
+          onClose={() => setBrowserOpen(false)}
+          connId={conn.id}
+          table={table}
+        />
+      )}
     </div>
   )
 }

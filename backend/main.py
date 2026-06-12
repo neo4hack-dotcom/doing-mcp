@@ -370,9 +370,11 @@ def enrich_catalog(conn_id: str, payload: dict = Body(default={}),
         targets = [t for t in catalog["tables"]
                    if not keys or f"{t['schema']}.{t['name']}" in keys][:36]
         enriched_count = 0
-        for start in range(0, len(targets), 12):
-            chunk = targets[start:start + 12]
-            results = llm_mod.enrich_catalog(db["settings"]["llm"], chunk)
+        failed: list[str] = []
+        last_error = ""
+
+        def merge(chunk: list[dict], results: list) -> int:
+            count = 0
             by_key = {(r.get("schema"), r.get("name")): r for r in results if isinstance(r, dict)}
             for table in chunk:
                 hit = by_key.get((table["schema"], table["name"]))
@@ -385,10 +387,33 @@ def enrich_catalog(conn_id: str, payload: dict = Body(default={}),
                     if info:
                         col["description"] = info.get("description", col.get("description", ""))
                         col["pii"] = bool(info.get("pii"))
-                enriched_count += 1
+                count += 1
+            return count
+
+        # Small chunks: large payloads are the main reason local models break JSON.
+        chunk_size = 4
+        for start in range(0, len(targets), chunk_size):
+            chunk = targets[start:start + chunk_size]
+            try:
+                enriched_count += merge(chunk, llm_mod.enrich_catalog(db["settings"]["llm"], chunk))
+            except llm_mod.LlmError:
+                # Fallback: one table at a time, skipping only the ones that still fail.
+                for table in chunk:
+                    try:
+                        enriched_count += merge([table],
+                                                llm_mod.enrich_catalog(db["settings"]["llm"], [table]))
+                    except llm_mod.LlmError as exc:
+                        failed.append(f"{table['schema']}.{table['name']}")
+                        last_error = str(exc)
+
+        if enriched_count == 0 and failed:
+            raise llm_mod.LlmError(
+                f"No table could be documented ({len(failed)} attempts). Last error: {last_error[:300]}")
         catalog["enriched_at"] = storage.now_iso()
-        storage.audit(db, "catalog.enrich", f"{conn['name']}: {enriched_count} tables documented by the AI")
-        return envelope(db, {"enriched": enriched_count})
+        storage.audit(db, "catalog.enrich",
+                      f"{conn['name']}: {enriched_count} tables documented by the AI"
+                      + (f" — {len(failed)} failed" if failed else ""))
+        return envelope(db, {"enriched": enriched_count, "failed": failed})
 
 
 @app.post("/api/connections/{conn_id}/preview")
@@ -403,6 +428,27 @@ def preview_table(conn_id: str, payload: dict = Body(...),
             return envelope(db, {"ok": True, "result": result})
         except Exception as exc:  # noqa: BLE001
             return envelope(db, {"ok": False, "error": str(exc)[:600]})
+
+
+@app.post("/api/connections/{conn_id}/browse")
+def browse_table(conn_id: str, payload: dict = Body(...)):
+    """Filtered/sorted table browsing for the data explorer (Metabase-style).
+
+    Read-only: it does NOT mutate db.json (no version bump). The explorer reloads
+    this on every keystroke/filter change, so keeping it side-effect free avoids a
+    state-change → re-render → refetch loop and keeps the metrics chart clean.
+    """
+    db = storage.load()
+    conn = get_conn_or_404(db, conn_id)
+    try:
+        result = connectors.browse(
+            conn, payload.get("schema", ""), payload.get("table", ""),
+            filters=payload.get("filters") or [],
+            sort=payload.get("sort"), limit=int(payload.get("limit", 100)),
+        )
+        return {"result": {"ok": True, "result": result}}
+    except Exception as exc:  # noqa: BLE001
+        return {"result": {"ok": False, "error": str(exc)[:600]}}
 
 
 @app.post("/api/connections/{conn_id}/profile")
