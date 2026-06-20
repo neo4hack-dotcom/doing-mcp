@@ -14,16 +14,22 @@ export class ApiError extends Error {
 }
 
 let baseVersion = 0
+let workspaceId = ''
 let conflictHandler: (() => void) | null = null
 
 export function onConflict(fn: () => void) {
   conflictHandler = fn
 }
 
+export function setWorkspace(id: string) {
+  workspaceId = id
+}
+
 async function http<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {}
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (method !== 'GET') headers['X-Base-Version'] = String(baseVersion)
+  if (workspaceId) headers['X-Workspace'] = workspaceId
   let res: Response
   try {
     res = await fetch(path, {
@@ -77,8 +83,20 @@ export const api = {
     http<{ result: ToolSuggestion }>('POST', '/api/llm/suggest-tool', { connection_id, sql, sample, hint }),
   reviewSql: (sql: string, dialect: string) =>
     http<{ result: SecurityReview }>('POST', '/api/llm/review-sql', { sql, dialect }),
+  enhanceSql: (connection_id: string, sql: string, goal: string) =>
+    http<{ result: SqlSuggestion }>('POST', '/api/llm/enhance-sql', { connection_id, sql, goal }),
   validateSql: (connection_id: string, sql: string) =>
     http<{ result: Validation }>('POST', '/api/sql/validate', { connection_id, sql }),
+
+  createWorkspace: (name: string, color?: string) =>
+    http<Env<{ id: string }>>('POST', '/api/workspaces', { name, color }),
+  updateWorkspace: (id: string, p: Record<string, unknown>) => http<Env>('PUT', `/api/workspaces/${id}`, p),
+  deleteWorkspace: (id: string) => http<Env<{ deleted: string }>>('DELETE', `/api/workspaces/${id}`),
+
+  createFolder: (name: string, color?: string) =>
+    http<Env<{ id: string }>>('POST', '/api/folders', { name, color }),
+  updateFolder: (id: string, p: Record<string, unknown>) => http<Env>('PUT', `/api/folders/${id}`, p),
+  deleteFolder: (id: string) => http<Env>('DELETE', `/api/folders/${id}`),
 
   createConnection: (p: Record<string, unknown>) => http<Env<{ id: string }>>('POST', '/api/connections', p),
   updateConnection: (id: string, p: Record<string, unknown>) => http<Env>('PUT', `/api/connections/${id}`, p),

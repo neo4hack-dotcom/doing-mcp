@@ -1,14 +1,15 @@
 // Tools tab: turn a query into an MCP tool — AI contract suggestion,
 // per-tool guardrails (rows, timeout, rate, PII masking), LLM security review, playground.
 import {
-  FlaskConical, Hammer, Lock, Pencil, Plus, ShieldAlert, Sparkles, Trash2, Wand2, X,
+  Check, FlaskConical, FolderPlus, Folder as FolderIcon, Hammer, Lock, Pencil, Plus,
+  ShieldAlert, Sparkles, Trash2, Wand2, X, Zap,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { api } from '../api'
 import { ParamInputs, ResultsTable, RiskBadge } from '../components/data'
 import {
   Badge, Button, Card, EmptyState, Field, Input, Modal, Select, Textarea,
-  Toggle, useBusy, useConfirm, useToast,
+  Toggle, cls, useBusy, useConfirm, useToast,
 } from '../components/ui'
 import type {
   ParamType, RowPolicy, RunOutcome, SecurityReview, ToolDef, ToolParam,
@@ -30,17 +31,18 @@ interface ToolForm {
   rate_per_min: string
   masked_columns: string
   tags: string
+  folder_id: string | null
   security_review: SecurityReview | null
   row_policy: RowPolicy
 }
 
 const PARAM_TYPES: ParamType[] = ['string', 'integer', 'number', 'boolean', 'date']
 
-function emptyForm(connId: string): ToolForm {
+function emptyForm(connId: string, folderId: string | null = null): ToolForm {
   return {
     id: null, name: '', description: '', connection_id: connId, query_id: null,
     sql: '', params: [], max_rows: '500', timeout_s: '30', rate_per_min: '120',
-    masked_columns: '', tags: '', security_review: null,
+    masked_columns: '', tags: '', folder_id: folderId, security_review: null,
     row_policy: { ...EMPTY_POLICY, rules: [] },
   }
 }
@@ -59,9 +61,59 @@ export default function Tools({ db, apply, goTo }: TabProps) {
   const [testOutcome, setTestOutcome] = useState<RunOutcome | null>(null)
   const [magicPrompt, setMagicPrompt] = useState('')
   const [magicConn, setMagicConn] = useState(() => db.connections[0]?.id ?? '')
+  const [folderFilter, setFolderFilter] = useState<string>('all')
+  const [foldersOpen, setFoldersOpen] = useState(false)
+  const [newFolderName, setNewFolderName] = useState('')
+  const [editFolderId, setEditFolderId] = useState<string | null>(null)
+  const [editFolderName, setEditFolderName] = useState('')
   const [busy, run] = useBusy()
   const toast = useToast()
   const confirm = useConfirm()
+
+  const folderName = (id: string | null | undefined) =>
+    db.folders.find((f) => f.id === id)?.name ?? null
+
+  const createFolder = () => run('folder', async () => {
+    const env = await api.createFolder(newFolderName || 'Folder')
+    apply(env)
+    setNewFolderName('')
+    toast.push('Folder created.', 'success')
+  })
+
+  const renameFolder = (id: string) => run('renameFolder', async () => {
+    apply(await api.updateFolder(id, { name: editFolderName }))
+    setEditFolderId(null)
+  })
+
+  const deleteFolder = (id: string, name: string) => {
+    void confirm({
+      title: 'Delete folder',
+      message: `“${name}” will be deleted. Its tools are kept and moved to “Unfiled”.`,
+    }).then((ok) => {
+      if (!ok) return
+      run('deleteFolder', async () => {
+        apply(await api.deleteFolder(id))
+        if (folderFilter === id) setFolderFilter('all')
+      })
+    })
+  }
+
+  const assignFolder = (tool: ToolDef, folderId: string) =>
+    run(`assign-${tool.id}`, async () => {
+      apply(await api.updateTool(tool.id, { folder_id: folderId || null }))
+    })
+
+  const enhance = () => form && run('enhance', async () => {
+    const { result } = await api.enhanceSql(form.connection_id, form.sql, '')
+    set({
+      sql: result.sql,
+      params: syncParams(result.sql, result.params.map((p) => ({
+        name: p.name, type: (PARAM_TYPES.includes(p.type as ParamType) ? (p.type as ParamType) : 'string'),
+        description: p.description ?? '', required: false, default: null,
+      }))),
+    })
+    toast.push(`Made more versatile: ${result.explanation || 'optional filters added.'}`, 'success')
+  })
 
   const magic = () => run('magic', async () => {
     const env = await api.magicTool(magicConn, magicPrompt)
@@ -86,7 +138,8 @@ export default function Tools({ db, apply, goTo }: TabProps) {
 
   const openCreate = () => {
     if (db.connections.length === 0) { goTo('connections'); return }
-    setForm(emptyForm(db.connections[0].id))
+    const presetFolder = db.folders.some((f) => f.id === folderFilter) ? folderFilter : null
+    setForm(emptyForm(db.connections[0].id, presetFolder))
   }
 
   const openFromQuery = (queryId: string) => {
@@ -105,7 +158,8 @@ export default function Tools({ db, apply, goTo }: TabProps) {
     params: tool.params, max_rows: String(tool.guardrails.max_rows),
     timeout_s: String(tool.guardrails.timeout_s), rate_per_min: String(tool.guardrails.rate_per_min),
     masked_columns: tool.guardrails.masked_columns.join(', '),
-    tags: tool.tags.join(', '), security_review: tool.security_review ?? null,
+    tags: tool.tags.join(', '), folder_id: tool.folder_id ?? null,
+    security_review: tool.security_review ?? null,
     row_policy: tool.row_policy
       ? { ...tool.row_policy, rules: tool.row_policy.rules.map((r) => ({ ...r })) }
       : { ...EMPTY_POLICY, rules: [] },
@@ -145,6 +199,7 @@ export default function Tools({ db, apply, goTo }: TabProps) {
         masked_columns: form.masked_columns.split(',').map((s) => s.trim()).filter(Boolean),
       },
       tags: form.tags.split(',').map((s) => s.trim()).filter(Boolean),
+      folder_id: form.folder_id,
       security_review: form.security_review,
       row_policy: {
         ...form.row_policy,
@@ -236,6 +291,38 @@ export default function Tools({ db, apply, goTo }: TabProps) {
         </Card>
       )}
 
+      {/* Folder filter bar */}
+      {db.tools.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {[
+            { id: 'all', label: 'All', n: db.tools.length },
+            ...db.folders.map((f) => ({ id: f.id, label: f.name, n: db.tools.filter((t) => t.folder_id === f.id).length })),
+            { id: 'none', label: 'Unfiled', n: db.tools.filter((t) => !t.folder_id).length },
+          ].map((chip) => (
+            <button
+              key={chip.id}
+              onClick={() => setFolderFilter(chip.id)}
+              className={cls(
+                'inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-colors',
+                folderFilter === chip.id
+                  ? 'bg-brand-600 text-white'
+                  : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300',
+              )}
+            >
+              {chip.id !== 'all' && chip.id !== 'none' && <FolderIcon size={11} />}
+              {chip.label}
+              <span className="opacity-60">{chip.n}</span>
+            </button>
+          ))}
+          <button
+            onClick={() => setFoldersOpen(true)}
+            className="inline-flex items-center gap-1 rounded-full border border-dashed border-zinc-300 px-2.5 py-1 text-xs text-zinc-500 hover:border-brand-400 hover:text-brand-600 dark:border-zinc-700"
+          >
+            <FolderPlus size={11} /> Manage folders
+          </button>
+        </div>
+      )}
+
       {db.tools.length === 0 ? (
         <EmptyState
           icon={Hammer}
@@ -245,7 +332,9 @@ export default function Tools({ db, apply, goTo }: TabProps) {
         />
       ) : (
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-          {db.tools.map((tool) => {
+          {db.tools
+            .filter((t) => folderFilter === 'all' || (folderFilter === 'none' ? !t.folder_id : t.folder_id === folderFilter))
+            .map((tool) => {
             const conn = connOf(tool.connection_id)
             return (
               <Card key={tool.id}>
@@ -266,12 +355,22 @@ export default function Tools({ db, apply, goTo }: TabProps) {
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-400">
                   <Badge tone="blue">{conn?.name ?? 'connection ?'}</Badge>
+                  {folderName(tool.folder_id) && <Badge tone="brand"><FolderIcon size={10} />{folderName(tool.folder_id)}</Badge>}
                   <span>{tool.params.length} param{tool.params.length > 1 ? 's' : ''}</span>
                   <span>· max {tool.guardrails.max_rows} rows</span>
                   <span>· {tool.guardrails.rate_per_min}/min</span>
                   {tool.tags.map((tag) => <Badge key={tag}>{tag}</Badge>)}
                 </div>
-                <div className="mt-3 flex gap-1.5">
+                <div className="mt-3 flex items-center gap-1.5">
+                  <Select
+                    value={tool.folder_id ?? ''}
+                    onChange={(e) => assignFolder(tool, e.target.value)}
+                    className="!w-auto !py-1 text-[11px]"
+                    title="Move to folder"
+                  >
+                    <option value="">No folder</option>
+                    {db.folders.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
+                  </Select>
                   <Button size="sm" variant="outline" icon={FlaskConical}
                     onClick={() => { setTestTool(tool); setTestValues({}); setTestIdentity(''); setTestOutcome(null) }}>
                     Test
@@ -302,21 +401,31 @@ export default function Tools({ db, apply, goTo }: TabProps) {
       >
         {form && (
           <div className="space-y-4">
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               <Button size="sm" variant="outline" icon={Sparkles} busy={busy === 'suggest'} onClick={suggest} disabled={!form.sql.trim()}>
                 Suggest the contract with AI
+              </Button>
+              <Button size="sm" variant="outline" icon={Zap} busy={busy === 'enhance'} onClick={enhance} disabled={!form.sql.trim()}
+                title="Rewrite the query with optional filters and dialect-specific power features">
+                Make versatile
               </Button>
               <Button size="sm" variant="outline" icon={ShieldAlert} busy={busy === 'review'} onClick={review} disabled={!form.sql.trim()}>
                 AI security review
               </Button>
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-3 gap-3">
               <Field label="Name (snake_case)">
                 <Input value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="top_customers_by_revenue" className="font-mono" />
               </Field>
               <Field label="Connection">
                 <Select value={form.connection_id} onChange={(e) => set({ connection_id: e.target.value })}>
                   {db.connections.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </Select>
+              </Field>
+              <Field label="Folder">
+                <Select value={form.folder_id ?? ''} onChange={(e) => set({ folder_id: e.target.value || null })}>
+                  <option value="">No folder</option>
+                  {db.folders.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
                 </Select>
               </Field>
             </div>
@@ -509,6 +618,47 @@ export default function Tools({ db, apply, goTo }: TabProps) {
             <ResultsTable outcome={testOutcome} />
           </div>
         )}
+      </Modal>
+
+      {/* ----- Manage folders ----- */}
+      <Modal open={foldersOpen} onClose={() => setFoldersOpen(false)} title="Folders">
+        <div className="space-y-3">
+          <p className="text-xs text-zinc-500">
+            Group tools into customizable folders to keep large MCP catalogs tidy. Folders live in
+            the current workspace.
+          </p>
+          <div className="space-y-1.5">
+            {db.folders.length === 0 && <p className="text-xs text-zinc-400">No folder yet.</p>}
+            {db.folders.map((f) => (
+              <div key={f.id} className="flex items-center gap-2 rounded-lg border border-zinc-200 px-2.5 py-1.5 dark:border-zinc-700">
+                {editFolderId === f.id ? (
+                  <>
+                    <Input value={editFolderName} onChange={(e) => setEditFolderName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') renameFolder(f.id) }} className="!py-1 text-xs" autoFocus />
+                    <button onClick={() => renameFolder(f.id)} className="text-emerald-500 hover:text-emerald-600"><Check size={14} /></button>
+                    <button onClick={() => setEditFolderId(null)} className="text-zinc-400 hover:text-zinc-600"><X size={14} /></button>
+                  </>
+                ) : (
+                  <>
+                    <FolderIcon size={13} className="text-brand-500" />
+                    <span className="flex-1 text-sm font-medium">{f.name}</span>
+                    <span className="text-[10px] text-zinc-400">{db.tools.filter((t) => t.folder_id === f.id).length} tools</span>
+                    <button onClick={() => { setEditFolderId(f.id); setEditFolderName(f.name) }} className="text-zinc-400 hover:text-zinc-600"><Pencil size={13} /></button>
+                    <button onClick={() => deleteFolder(f.id, f.name)} className="text-red-400 hover:text-red-600"><Trash2 size={13} /></button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+          <Field label="New folder">
+            <div className="flex gap-2">
+              <Input value={newFolderName} onChange={(e) => setNewFolderName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && newFolderName.trim()) createFolder() }}
+                placeholder="e.g. Sales, Finance, Ops…" className="text-xs" />
+              <Button icon={FolderPlus} busy={busy === 'folder'} onClick={createFolder} disabled={!newFolderName.trim()}>Create</Button>
+            </div>
+          </Field>
+        </div>
       </Modal>
     </div>
   )

@@ -99,7 +99,11 @@ from fastmcp import FastMCP
 _DENY_RE = re.compile(
     r"\\b(insert|update|delete|drop|alter|truncate|grant|revoke|create|replace|attach|"
     r"detach|rename|optimize|kill|system|call|execute|exec|commit|rollback|savepoint|"
-    r"lock|vacuum|outfile|infile|into|merge|settings|set)\\b", re.IGNORECASE)
+    r"lock|vacuum|outfile|infile|into|merge|set)\\b", re.IGNORECASE)
+_EXFIL_RE = re.compile(
+    r"\\b(url|file|remote|remotesecure|s3|s3cluster|hdfs|hdfscluster|mysql|postgresql|"
+    r"jdbc|odbc|mongodb|redis|sqlite|executable|azureblobstorage|deltalake|hudi|iceberg|"
+    r"urlcluster|gcs|deltalakecluster)\\s*\\(", re.IGNORECASE)
 _PARAM_RE = re.compile(r"(?<![:\\w]):([A-Za-z_]\\w*)")
 
 _CLIENTS: dict = {}
@@ -121,6 +125,9 @@ def _guard(sql: str) -> None:
     bad = _DENY_RE.search(sql)
     if bad:
         raise ValueError("Guardrail: forbidden keyword '" + bad.group(1).upper() + "'.")
+    exfil = _EXFIL_RE.search(sql)
+    if exfil:
+        raise ValueError("Guardrail: external I/O function not allowed '" + exfil.group(1) + "()'.")
 
 
 def _rate(tool: str, per_min: int) -> None:
@@ -191,7 +198,7 @@ def _rls_apply(sql: str, kind: str, policy: dict, identity) -> tuple:
 
 def _execute(conn_name: str, sql: str, params: dict, max_rows: int,
              timeout_s: int, masked: list, policy: dict | None = None,
-             identity=None) -> dict:
+             identity=None, required: list | None = None) -> dict:
     cfg = CONNECTIONS[conn_name]
     rls_params: dict = {}
     if policy and policy.get("enabled") and policy.get("rules"):
@@ -202,7 +209,11 @@ def _execute(conn_name: str, sql: str, params: dict, max_rows: int,
     used = set(_PARAM_RE.findall(sql))
     merged = dict(params or {})
     merged.update(rls_params)
-    bind = {k: v for k, v in merged.items() if k in used and v is not None}
+    # Keep None binds (optional params -> SQL NULL); only required params must be set.
+    bind = {k: merged.get(k) for k in used if k in merged}
+    missing = [p for p in (required or []) if p in used and bind.get(p) is None]
+    if missing:
+        raise ValueError("Missing required parameters: " + ", ".join(sorted(missing)))
     missing = [p for p in used if p not in bind]
     if missing:
         raise ValueError("Missing required parameters: " + ", ".join(sorted(missing)))
@@ -397,6 +408,8 @@ def generate_server_py(db: dict, project: dict) -> str:
         signature = build_signature(params)
         arg_names = [py_ident(p["name"]) for p in params]
         params_dict = "{" + ", ".join(f'"{a}": {a}' for a in arg_names) + "}"
+        required = [py_ident(p["name"]) for p in params
+                    if p.get("required", True) and py_ident(p["name"]) != identity_arg]
 
         block = []
         block.append(f"@mcp.tool(name={json.dumps(name)}, description={json.dumps(desc, ensure_ascii=False)})")
@@ -405,6 +418,7 @@ def generate_server_py(db: dict, project: dict) -> str:
         block.append(f"    return _execute({json.dumps(conn_key(conn))}, _SQL[{json.dumps(name)}], {params_dict},")
         block.append(f"                    max_rows={int(gr.get('max_rows', 500))}, timeout_s={int(gr.get('timeout_s', 30))},")
         block.append(f"                    masked={json.dumps(gr.get('masked_columns', []), ensure_ascii=False)},")
+        block.append(f"                    required={json.dumps(required)},")
         if rls_on:
             block.append(f"                    policy=_RLS[{json.dumps(name)}], identity={identity_arg})")
         else:
@@ -516,8 +530,12 @@ def mcp_client_snippet(project: dict) -> str:
 
 def generate_readme(db: dict, project: dict) -> str:
     tools = [t for t in db["tools"] if t["id"] in project.get("tool_ids", []) and t.get("enabled", True)]
+    def first_line(text: str) -> str:
+        lines = (text or "").splitlines()
+        return lines[0][:100] if lines else "—"
+
     tool_rows = "\n".join(
-        f"| `{py_ident(t['name'])}` | {(t.get('description') or '').splitlines()[0][:100]} | "
+        f"| `{py_ident(t['name'])}` | {first_line(t.get('description'))} | "
         f"{', '.join(p['name'] for p in t.get('params', [])) or '—'} |"
         for t in tools
     )
