@@ -135,20 +135,59 @@ def parse_json_loose(text: str):
 
 # ---------------------------------------------------------------- Business tasks
 
+CLICKHOUSE_TIPS = (
+    " ClickHouse power features you may use: CTEs (WITH), ARRAY JOIN, LIMIT n BY col, "
+    "SAMPLE, FINAL, GROUP BY WITH ROLLUP/CUBE/TOTALS, window functions, and aggregate "
+    "combinators (uniqExact, quantile, argMax, groupArray, countIf, sumIf, topK). "
+    "You may append a read-only `SETTINGS` clause when helpful (e.g. SETTINGS max_threads=4). "
+    "Never use external I/O table functions (url, file, remote, s3, mysql, postgresql…)."
+)
+VERSATILE_HINT = (
+    " Prefer VERSATILE tools: expose optional filters with the pattern "
+    "(:param IS NULL OR column = :param) so callers can omit a parameter to skip that filter. "
+    "Mark such parameters as required=false."
+)
+
+
+def _dialect_tips(dialect: str) -> str:
+    return VERSATILE_HINT + (CLICKHOUSE_TIPS if dialect == "clickhouse" else "")
+
+
 def generate_sql(llm: dict, dialect: str, schema_context: str, request: str) -> dict:
     system = (
         f"You are a {dialect} SQL expert. You generate ONLY read-only SELECT queries, "
         "a single statement, without a trailing semicolon. Use named parameters of the form "
-        ":param_name for any value the user may want to vary. "
-        "Reply STRICTLY in JSON: {\"sql\": \"...\", \"explanation\": \"...\", "
+        ":param_name for any value the user may want to vary." + _dialect_tips(dialect) +
+        " Reply STRICTLY in JSON: {\"sql\": \"...\", \"explanation\": \"...\", "
         "\"params\": [{\"name\": \"...\", \"type\": \"string|integer|number|boolean|date\", "
-        "\"description\": \"...\"}]} — explanation and descriptions in English."
+        "\"description\": \"...\", \"required\": true}]} — explanation and descriptions in English."
     )
     user = f"Available schema:\n{schema_context}\n\nRequest: {request}"
     out = parse_json_loose(chat(llm, [{"role": "system", "content": system},
                                       {"role": "user", "content": user}]))
     if not isinstance(out, dict) or not out.get("sql"):
         raise LlmError("The LLM did not produce a “sql” field.")
+    out.setdefault("explanation", "")
+    out.setdefault("params", [])
+    return out
+
+
+def enhance_sql(llm: dict, dialect: str, schema_context: str, sql: str, goal: str) -> dict:
+    """Rewrite a query to be more versatile/efficient (optional filters, dialect features)."""
+    system = (
+        f"You are a {dialect} SQL optimization expert. Rewrite the given read-only SELECT to be "
+        "more versatile and efficient WITHOUT changing its core intent." + _dialect_tips(dialect) +
+        " Keep a single statement, no trailing semicolon. "
+        "Reply STRICTLY in JSON: {\"sql\": \"...\", \"explanation\": \"what you changed and why, English\", "
+        "\"params\": [{\"name\": \"...\", \"type\": \"string|integer|number|boolean|date\", "
+        "\"description\": \"...\", \"required\": false}]}."
+    )
+    user = (f"Schema:\n{schema_context}\n\nCurrent SQL:\n{sql}\n\n"
+            f"Goal: {goal or 'add optional filters and use the dialect efficiently'}")
+    out = parse_json_loose(chat(llm, [{"role": "system", "content": system},
+                                      {"role": "user", "content": user}]))
+    if not isinstance(out, dict) or not out.get("sql"):
+        raise LlmError("The LLM did not produce an enhanced query.")
     out.setdefault("explanation", "")
     out.setdefault("params", [])
     return out

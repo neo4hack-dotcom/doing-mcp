@@ -95,6 +95,13 @@ def get_conn_or_404(db: dict, conn_id: str) -> dict:
     return conn
 
 
+def resolve_workspace(db: dict, x_workspace: str | None) -> str:
+    """Pick the workspace for a write: the requested one if it exists, else the first."""
+    if x_workspace and storage.find(db["workspaces"], x_workspace):
+        return x_workspace
+    return db["workspaces"][0]["id"]
+
+
 def schema_context(db: dict, conn_id: str, max_tables: int = 30) -> str:
     catalog = db["catalog"].get(conn_id) or {"tables": []}
     lines = []
@@ -259,12 +266,116 @@ def llm_review_sql(payload: dict = Body(...)):
     return {"result": out}
 
 
+@app.post("/api/llm/enhance-sql")
+def llm_enhance_sql(payload: dict = Body(...)):
+    """Make a query more versatile/efficient (optional filters, dialect features)."""
+    db = storage.load()
+    conn = get_conn_or_404(db, payload.get("connection_id", ""))
+    dialect = connectors.dialect(conn["kind"])
+    out = llm_mod.enhance_sql(db["settings"]["llm"], dialect, schema_context(db, conn["id"]),
+                              payload.get("sql", ""), payload.get("goal", ""))
+    out["validation"] = guardrails.validate(out["sql"], dialect, guard_cfg(db))
+    return {"result": out}
+
+
 @app.post("/api/sql/validate")
 def validate_sql(payload: dict = Body(...)):
     db = storage.load()
     conn = get_conn_or_404(db, payload.get("connection_id", ""))
     return {"result": guardrails.validate(payload.get("sql", ""),
                                           connectors.dialect(conn["kind"]), guard_cfg(db))}
+
+
+# ---------------------------------------------------------------- Workspaces
+
+@app.post("/api/workspaces")
+def create_workspace(payload: dict = Body(...),
+                     x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    with mutation(x_base_version) as db:
+        ws = {"id": storage.new_id("ws"), "name": payload.get("name") or "Workspace",
+              "color": payload.get("color") or "indigo", "created_at": storage.now_iso()}
+        db["workspaces"].append(ws)
+        storage.audit(db, "workspace.create", ws["name"])
+        return envelope(db, {"id": ws["id"]})
+
+
+@app.put("/api/workspaces/{ws_id}")
+def update_workspace(ws_id: str, payload: dict = Body(...),
+                     x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    with mutation(x_base_version) as db:
+        ws = storage.find(db["workspaces"], ws_id)
+        if not ws:
+            raise HTTPException(404, "Workspace not found.")
+        for key in ("name", "color"):
+            if key in payload:
+                ws[key] = payload[key]
+        storage.audit(db, "workspace.update", ws["name"])
+        return envelope(db)
+
+
+@app.delete("/api/workspaces/{ws_id}")
+def delete_workspace(ws_id: str,
+                     x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    with mutation(x_base_version) as db:
+        ws = storage.find(db["workspaces"], ws_id)
+        if not ws:
+            raise HTTPException(404, "Workspace not found.")
+        if len(db["workspaces"]) <= 1:
+            raise HTTPException(400, "Cannot delete the last workspace.")
+        for project in [p for p in db["projects"] if p.get("workspace_id") == ws_id]:
+            runner.stop(project["id"])
+        db["projects"] = [p for p in db["projects"] if p.get("workspace_id") != ws_id]
+        db["tools"] = [t for t in db["tools"] if t.get("workspace_id") != ws_id]
+        db["queries"] = [q for q in db["queries"] if q.get("workspace_id") != ws_id]
+        db["folders"] = [f for f in db["folders"] if f.get("workspace_id") != ws_id]
+        db["workspaces"] = [w for w in db["workspaces"] if w["id"] != ws_id]
+        storage.audit(db, "workspace.delete", ws["name"], "warn")
+        return envelope(db, {"deleted": ws_id})
+
+
+# ---------------------------------------------------------------- Folders
+
+@app.post("/api/folders")
+def create_folder(payload: dict = Body(...),
+                  x_base_version: str | None = Header(None, alias="X-Base-Version"),
+                  x_workspace: str | None = Header(None, alias="X-Workspace")):
+    with mutation(x_base_version) as db:
+        folder = {"id": storage.new_id("fld"), "name": payload.get("name") or "Folder",
+                  "color": payload.get("color") or "zinc",
+                  "workspace_id": resolve_workspace(db, x_workspace),
+                  "created_at": storage.now_iso()}
+        db["folders"].append(folder)
+        storage.audit(db, "folder.create", folder["name"])
+        return envelope(db, {"id": folder["id"]})
+
+
+@app.put("/api/folders/{folder_id}")
+def update_folder(folder_id: str, payload: dict = Body(...),
+                  x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    with mutation(x_base_version) as db:
+        folder = storage.find(db["folders"], folder_id)
+        if not folder:
+            raise HTTPException(404, "Folder not found.")
+        for key in ("name", "color"):
+            if key in payload:
+                folder[key] = payload[key]
+        storage.audit(db, "folder.update", folder["name"])
+        return envelope(db)
+
+
+@app.delete("/api/folders/{folder_id}")
+def delete_folder(folder_id: str,
+                  x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    with mutation(x_base_version) as db:
+        folder = storage.find(db["folders"], folder_id)
+        if not folder:
+            raise HTTPException(404, "Folder not found.")
+        for tool in db["tools"]:
+            if tool.get("folder_id") == folder_id:
+                tool["folder_id"] = None
+        db["folders"] = [f for f in db["folders"] if f["id"] != folder_id]
+        storage.audit(db, "folder.delete", folder["name"], "warn")
+        return envelope(db)
 
 
 # ---------------------------------------------------------------- Connections
@@ -485,7 +596,8 @@ def run_sql(conn_id: str, payload: dict = Body(...),
 
 @app.post("/api/queries")
 def create_query(payload: dict = Body(...),
-                 x_base_version: str | None = Header(None, alias="X-Base-Version")):
+                 x_base_version: str | None = Header(None, alias="X-Base-Version"),
+                 x_workspace: str | None = Header(None, alias="X-Workspace")):
     with mutation(x_base_version) as db:
         get_conn_or_404(db, payload.get("connection_id", ""))
         query = {
@@ -495,6 +607,7 @@ def create_query(payload: dict = Body(...),
             "connection_id": payload["connection_id"],
             "sql": payload.get("sql", ""),
             "params": guardrails.extract_params(payload.get("sql", "")),
+            "workspace_id": resolve_workspace(db, x_workspace),
             "created_at": storage.now_iso(), "last_run": None, "sample": None,
         }
         db["queries"].insert(0, query)
@@ -634,10 +747,13 @@ def _scaffold_templates(conn: dict, table: dict) -> dict[str, dict]:
 
 @app.post("/api/tools/scaffold")
 def scaffold_tools(payload: dict = Body(...),
-                   x_base_version: str | None = Header(None, alias="X-Base-Version")):
+                   x_base_version: str | None = Header(None, alias="X-Base-Version"),
+                   x_workspace: str | None = Header(None, alias="X-Workspace")):
     """One-click starter tools (list / get_by_id / count_by / search) for a table."""
     with mutation(x_base_version) as db:
         conn = get_conn_or_404(db, payload.get("connection_id", ""))
+        ws_id = resolve_workspace(db, x_workspace)
+        folder_id = payload.get("folder_id")
         catalog = db["catalog"].get(conn["id"]) or {"tables": []}
         table = next((t for t in catalog["tables"]
                       if t["schema"] == payload.get("schema") and t["name"] == payload.get("table")), None)
@@ -659,6 +775,7 @@ def scaffold_tools(payload: dict = Body(...),
                 "query_id": None, "sql": tpl["sql"], "params": tpl["params"],
                 "guardrails": normalize_guardrails(None, db["settings"]["guardrails"]),
                 "row_policy": rls.default_policy(),
+                "workspace_id": ws_id, "folder_id": folder_id,
                 "tags": ["scaffold", table["name"]], "enabled": True,
                 "security_review": None, "created_at": storage.now_iso(),
             })
@@ -670,7 +787,8 @@ def scaffold_tools(payload: dict = Body(...),
 
 @app.post("/api/tools/magic")
 def magic_tool(payload: dict = Body(...),
-               x_base_version: str | None = Header(None, alias="X-Base-Version")):
+               x_base_version: str | None = Header(None, alias="X-Base-Version"),
+               x_workspace: str | None = Header(None, alias="X-Workspace")):
     """One-shot NL → tool: generate SQL, validate, dry-run, suggest the contract, create."""
     with mutation(x_base_version) as db:
         conn = get_conn_or_404(db, payload.get("connection_id", ""))
@@ -708,6 +826,8 @@ def magic_tool(payload: dict = Body(...),
             "connection_id": conn["id"], "query_id": None, "sql": sql, "params": params,
             "guardrails": normalize_guardrails(None, db["settings"]["guardrails"]),
             "row_policy": rls.default_policy(),
+            "workspace_id": resolve_workspace(db, x_workspace),
+            "folder_id": payload.get("folder_id"),
             "tags": [str(t) for t in (suggestion.get("tags") or [])][:5],
             "enabled": True, "security_review": None, "created_at": storage.now_iso(),
         }
@@ -720,13 +840,17 @@ def magic_tool(payload: dict = Body(...),
 
 @app.post("/api/tools")
 def create_tool(payload: dict = Body(...),
-                x_base_version: str | None = Header(None, alias="X-Base-Version")):
+                x_base_version: str | None = Header(None, alias="X-Base-Version"),
+                x_workspace: str | None = Header(None, alias="X-Workspace")):
     with mutation(x_base_version) as db:
         conn = get_conn_or_404(db, payload.get("connection_id", ""))
         sql = payload.get("sql", "")
         validation = guardrails.validate(sql, connectors.dialect(conn["kind"]), guard_cfg(db))
         if not validation["ok"]:
             raise HTTPException(400, "SQL rejected by the guardrails: " + " ".join(validation["errors"]))
+        folder_id = payload.get("folder_id")
+        if folder_id and not storage.find(db["folders"], folder_id):
+            folder_id = None
         tool = {
             "id": storage.new_id("tool"),
             "name": codegen.py_ident(payload.get("name") or "tool"),
@@ -737,6 +861,8 @@ def create_tool(payload: dict = Body(...),
             "params": normalize_params(payload.get("params")),
             "guardrails": normalize_guardrails(payload.get("guardrails"), db["settings"]["guardrails"]),
             "row_policy": rls.normalize(payload.get("row_policy")),
+            "workspace_id": resolve_workspace(db, x_workspace),
+            "folder_id": folder_id,
             "tags": [str(t) for t in (payload.get("tags") or [])],
             "enabled": True,
             "security_review": payload.get("security_review"),
@@ -770,6 +896,9 @@ def update_tool(tool_id: str, payload: dict = Body(...),
         for key in ("description", "connection_id", "tags", "enabled", "security_review"):
             if key in payload:
                 tool[key] = payload[key]
+        if "folder_id" in payload:
+            fid = payload["folder_id"]
+            tool["folder_id"] = fid if (fid and storage.find(db["folders"], fid)) else None
         if "name" in payload:
             tool["name"] = codegen.py_ident(payload["name"])
         if "params" in payload:
@@ -820,6 +949,9 @@ def test_tool(tool_id: str, payload: dict = Body(default={}),
                 if param.get("required", True):
                     return envelope(db, {"ok": False,
                                          "error": f"Missing required parameter: {param['name']}"})
+                # Optional + omitted → bind SQL NULL, enabling dynamic filters such as
+                # WHERE (:param IS NULL OR column = :param).
+                coerced[param["name"]] = None
                 continue
             try:
                 if param["type"] == "integer":
@@ -864,7 +996,8 @@ def unique_slug(db: dict, name: str, exclude_id: str | None = None) -> str:
 
 @app.post("/api/projects")
 def create_project(payload: dict = Body(...),
-                   x_base_version: str | None = Header(None, alias="X-Base-Version")):
+                   x_base_version: str | None = Header(None, alias="X-Base-Version"),
+                   x_workspace: str | None = Header(None, alias="X-Workspace")):
     with mutation(x_base_version) as db:
         name = payload.get("name") or "My MCP server"
         project = {
@@ -877,6 +1010,7 @@ def create_project(payload: dict = Body(...),
             "transport": payload.get("transport") if payload.get("transport") in ("stdio", "http") else "stdio",
             "port": int(payload.get("port") or 8900),
             "version": "1.0.0",
+            "workspace_id": resolve_workspace(db, x_workspace),
             "created_at": storage.now_iso(), "updated_at": storage.now_iso(),
             "generated_at": None,
         }
@@ -1043,25 +1177,29 @@ def bundle_project(project_id: str):
 
 @app.post("/api/projects/import")
 def import_project(payload: dict = Body(...),
-                   x_base_version: str | None = Header(None, alias="X-Base-Version")):
+                   x_base_version: str | None = Header(None, alias="X-Base-Version"),
+                   x_workspace: str | None = Header(None, alias="X-Workspace")):
     with mutation(x_base_version) as db:
         bundle = payload.get("bundle") or payload
         src_project = bundle.get("project")
         if not isinstance(src_project, dict):
             raise HTTPException(400, "Invalid bundle: missing “project” field.")
+        ws_id = resolve_workspace(db, x_workspace)
         target_conn = payload.get("connection_id") or (
             db["connections"][0]["id"] if db["connections"] else None)
         id_map = {}
         for src_tool in bundle.get("tools", []):
             new_tool = dict(src_tool)
             new_tool["id"] = storage.new_id("tool")
+            new_tool["workspace_id"] = ws_id
+            new_tool["folder_id"] = None
             if target_conn and not storage.find(db["connections"], new_tool.get("connection_id", "")):
                 new_tool["connection_id"] = target_conn
             db["tools"].insert(0, new_tool)
             id_map[src_tool["id"]] = new_tool["id"]
         name = src_project.get("name", "Imported project") + " (import)"
         project = {**src_project, "id": storage.new_id("proj"), "name": name,
-                   "slug": unique_slug(db, name),
+                   "slug": unique_slug(db, name), "workspace_id": ws_id,
                    "tool_ids": [id_map.get(tid) for tid in src_project.get("tool_ids", [])
                                 if id_map.get(tid)],
                    "created_at": storage.now_iso(), "updated_at": storage.now_iso(),

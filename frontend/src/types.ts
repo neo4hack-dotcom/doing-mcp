@@ -75,6 +75,7 @@ export interface SavedQuery {
   connection_id: string
   sql: string
   params: string[]
+  workspace_id?: string
   created_at: string
   last_run: { ts: string; ok: boolean; ms: number; rows: number } | null
   sample: QueryResult | null
@@ -118,6 +119,21 @@ export const EMPTY_POLICY: RowPolicy = {
   enabled: false, identity_arg: 'user_id', default_visibility: 'deny', rules: [],
 }
 
+export interface Workspace {
+  id: string
+  name: string
+  color: string
+  created_at: string
+}
+
+export interface Folder {
+  id: string
+  name: string
+  color: string
+  workspace_id: string
+  created_at: string
+}
+
 export interface ToolDef {
   id: string
   name: string
@@ -128,6 +144,8 @@ export interface ToolDef {
   params: ToolParam[]
   guardrails: ToolGuardrails
   row_policy?: RowPolicy
+  workspace_id?: string
+  folder_id?: string | null
   tags: string[]
   enabled: boolean
   security_review?: SecurityReview | null
@@ -143,6 +161,7 @@ export interface Project {
   transport: 'stdio' | 'http'
   port: number
   version: string
+  workspace_id?: string
   created_at: string
   updated_at: string
   generated_at: string | null
@@ -190,6 +209,8 @@ export interface GuardrailSettings {
 
 export interface AppData {
   settings: { llm: LlmSettings; guardrails: GuardrailSettings }
+  workspaces: Workspace[]
+  folders: Folder[]
   connections: Connection[]
   catalog: Record<string, Catalog>
   queries: SavedQuery[]

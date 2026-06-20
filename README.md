@@ -116,6 +116,28 @@ The Explorer is built to roam your data without friction:
 - **Open in SQL Studio** — seed the editor from the current table (pinned fields first). Your SQL/prompt **draft survives tab switches**, so you can pop back to the Explorer to check a value and return without losing your work. ⌘/Ctrl + Enter runs the query.
 - The active connection is remembered across Explorer ↔ SQL Studio.
 
+## Workspaces & folders
+
+- **Workspaces** isolate each user's work — folders, tools, queries and projects live in the
+  active workspace, so concurrent users never overwrite each other. Connections, catalog and
+  settings stay shared infrastructure. Switch/create/rename/delete from the sidebar; the active
+  workspace is sent as an `X-Workspace` header and stamped on every created item.
+- **Folders** group tools into customizable, color-tagged buckets (per workspace). Filter the
+  tool list by folder, move a tool from its card, or assign it in the editor.
+
+## ClickHouse flexibility & versatile tools
+
+- **Dialect-aware guardrails**: ClickHouse power features pass through — CTEs (`WITH`),
+  `ARRAY JOIN`, `LIMIT n BY`, `SAMPLE`, `FINAL`, `GROUP BY WITH ROLLUP/CUBE/TOTALS`, window
+  functions, aggregate combinators (`uniqExact`, `quantile`, `argMax`, `countIf`…), and a
+  read-only `SETTINGS` clause. External I/O table functions (`url`, `file`, `remote`, `s3`,
+  `mysql`, `postgresql`…) are still blocked as exfiltration/SSRF vectors.
+- **Optional parameters → dynamic filters**: an optional parameter binds SQL `NULL` when omitted,
+  enabling versatile tools with the `WHERE (:param IS NULL OR column = :param)` pattern — one tool
+  serves many call shapes. Enforced in the app and the generated server (required vs optional).
+- **Make versatile** (tool editor): the local LLM rewrites a query to add optional filters and use
+  the dialect efficiently. NL→SQL and the magic tool are primed with the same guidance.
+
 ## Row-level security (RLS)
 
 Each tool can carry a *row policy*: an *identity argument* (default `user_id`) is added to the

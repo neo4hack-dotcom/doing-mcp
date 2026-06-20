@@ -15,6 +15,9 @@ AUDIT_CAP = 400
 METRIC_CAP = 300
 
 
+DEFAULT_WORKSPACE_ID = "ws_default"
+
+
 def default_db() -> dict:
     return {
         "version": 1,
@@ -35,6 +38,9 @@ def default_db() -> dict:
                 "deny_keywords": [],
             },
         },
+        "workspaces": [{"id": DEFAULT_WORKSPACE_ID, "name": "Default",
+                        "color": "indigo", "created_at": now_iso()}],
+        "folders": [],
         "connections": [],
         "catalog": {},
         "queries": [],
@@ -56,6 +62,18 @@ def _merge_defaults(db: dict) -> dict:
     for key, value in base["settings"]["guardrails"].items():
         db["settings"]["guardrails"].setdefault(key, value)
     db["metrics"].setdefault("query_runs", [])
+
+    # Migration: ensure a workspace exists and stamp legacy items into it.
+    if not db.get("workspaces"):
+        db["workspaces"] = [{"id": DEFAULT_WORKSPACE_ID, "name": "Default",
+                             "color": "indigo", "created_at": now_iso()}]
+    db.setdefault("folders", [])
+    ws0 = db["workspaces"][0]["id"]
+    for collection in ("folders", "queries", "tools", "projects"):
+        for item in db.get(collection, []):
+            item.setdefault("workspace_id", ws0)
+    for tool in db.get("tools", []):
+        tool.setdefault("folder_id", None)
     return db
 
 

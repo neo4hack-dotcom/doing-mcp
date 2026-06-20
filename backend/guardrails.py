@@ -9,12 +9,26 @@ Defense in depth, independent of the LLM:
 """
 import re
 
+# Statement-level keywords that imply writes / DDL / session changes — always denied.
+# Note: ClickHouse's read-only `SETTINGS` clause and `WITH` CTEs are intentionally
+# NOT here, so power-user analytical queries (ARRAY JOIN, LIMIT BY, SAMPLE, FINAL,
+# GROUP BY WITH ROLLUP/CUBE, window functions…) pass through.
 DENY_DEFAULT = [
     "insert", "update", "delete", "drop", "alter", "truncate", "grant", "revoke",
     "create", "replace", "attach", "detach", "rename", "optimize", "kill",
     "system", "call", "execute", "exec", "commit", "rollback", "savepoint",
-    "lock", "vacuum", "outfile", "infile", "into", "merge", "settings", "set",
+    "lock", "vacuum", "outfile", "infile", "into", "merge", "set",
 ]
+
+# Table/IO functions that read from outside the database (exfiltration / SSRF):
+# blocked only when used as a function call, so they never clash with column names.
+EXFIL_FUNCS = [
+    "url", "file", "remote", "remotesecure", "s3", "s3cluster", "hdfs", "hdfscluster",
+    "mysql", "postgresql", "jdbc", "odbc", "mongodb", "redis", "sqlite",
+    "executable", "azureblobstorage", "deltalake", "hudi", "iceberg",
+    "urlcluster", "gcs", "deltalakecluster",
+]
+EXFIL_RE = re.compile(r"\b(" + "|".join(EXFIL_FUNCS) + r")\s*\(", re.IGNORECASE)
 
 PARAM_RE = re.compile(r"(?<![:\w]):([A-Za-z_]\w*)")
 LIMIT_RE = re.compile(r"\blimit\s+(\d+|:\w+)", re.IGNORECASE)
@@ -103,6 +117,12 @@ def validate(sql: str, dialect: str, cfg: dict) -> dict:
     found = sorted({kw for kw in deny if re.search(rf"\b{re.escape(kw)}\b", lowered)})
     if found:
         errors.append("Forbidden keywords detected: " + ", ".join(k.upper() for k in found) + ".")
+
+    # External I/O table functions (exfiltration / SSRF) — function-call form only.
+    exfil = sorted({m.group(1).lower() for m in EXFIL_RE.finditer(lowered)})
+    if exfil:
+        errors.append("External I/O functions are not allowed: "
+                      + ", ".join(f"{f}()" for f in exfil) + ".")
 
     params = extract_params(raw)
     max_rows = int(cfg.get("max_rows", 500))

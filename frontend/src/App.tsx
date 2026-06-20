@@ -5,8 +5,9 @@ import {
   Settings as SettingsIcon, SquareTerminal, Sun, Workflow, WifiOff,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
-import { api, onConflict } from './api'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { api, onConflict, setWorkspace } from './api'
+import WorkspaceSwitcher from './components/WorkspaceSwitcher'
 import { Button, Spinner, StatusDot, ToastProvider, ConfirmProvider, cls, useToast } from './components/ui'
 import type { AppData, Envelope } from './types'
 import Audit from './tabs/Audit'
@@ -39,7 +40,18 @@ function Shell() {
   const [pins, setPins] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem('doing.pins') ?? '[]') as string[] } catch { return [] }
   })
+  const [workspaceId, setWorkspaceId] = useState<string>(() => localStorage.getItem('doing.workspace') ?? '')
   const toast = useToast()
+
+  // Keep the active workspace valid against the loaded state, and sync the API header.
+  useEffect(() => {
+    if (!db) return
+    const ids = db.workspaces.map((w) => w.id)
+    const next = ids.includes(workspaceId) ? workspaceId : (ids[0] ?? '')
+    if (next !== workspaceId) setWorkspaceId(next)
+    setWorkspace(next)
+    localStorage.setItem('doing.workspace', next)
+  }, [db, workspaceId])
 
   const togglePin = useCallback((key: string) => {
     setPins((prev) => {
@@ -57,6 +69,22 @@ function Shell() {
   useEffect(() => { localStorage.setItem('doing.tab', tab) }, [tab])
 
   const apply = useCallback((env: Envelope<unknown>) => { setDb(env.data) }, [])
+
+  // Per-workspace view: each user's tools/folders/queries/projects stay isolated,
+  // while connections, catalog and settings stay shared infrastructure.
+  const scopedDb = useMemo<AppData | null>(() => {
+    if (!db) return null
+    const ws = db.workspaces.some((w) => w.id === workspaceId)
+      ? workspaceId : (db.workspaces[0]?.id ?? '')
+    const inWs = <T extends { workspace_id?: string }>(x: T) => (x.workspace_id ?? ws) === ws
+    return {
+      ...db,
+      folders: db.folders.filter(inWs),
+      tools: db.tools.filter(inWs),
+      queries: db.queries.filter(inWs),
+      projects: db.projects.filter(inWs),
+    }
+  }, [db, workspaceId])
 
   const reload = useCallback(async () => {
     try {
@@ -96,7 +124,7 @@ function Shell() {
     )
   }
 
-  if (!db) {
+  if (!db || !scopedDb) {
     return (
       <div className="flex min-h-screen items-center justify-center gap-3">
         <Spinner size={20} />
@@ -105,18 +133,26 @@ function Shell() {
     )
   }
 
-  const tabProps = { db, apply, goTo, pins, togglePin }
+  const tabProps = { db: scopedDb, apply, goTo, pins, togglePin }
   const llmOk = Boolean(db.settings.llm.last_test?.ok)
 
   return (
     <div className="flex min-h-screen">
       {/* Sidebar */}
       <aside className="fixed inset-y-0 left-0 z-40 flex w-56 flex-col border-r border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-        <div className="px-5 pb-4 pt-5">
+        <div className="px-5 pb-3 pt-5">
           <h1 className="text-lg font-bold tracking-tight">
             DOINg<span className="text-brand-500">.</span>MCP
           </h1>
           <p className="text-[10px] uppercase tracking-widest text-zinc-400">MCP server factory</p>
+        </div>
+        <div className="px-3 pb-3">
+          <WorkspaceSwitcher
+            db={db}
+            workspaceId={workspaceId}
+            onSwitch={setWorkspaceId}
+            apply={apply}
+          />
         </div>
         <nav className="flex-1 space-y-0.5 px-3">
           {TABS.map(({ id, label, icon: Icon }) => (
