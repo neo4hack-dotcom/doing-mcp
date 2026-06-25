@@ -157,4 +157,9 @@ export const api = {
   exportUrl: (id: string) => `/api/projects/${id}/export`,
 
   clearAudit: () => http<Env>('DELETE', '/api/audit'),
+
+  exportBackupUrl: () => '/api/export',
+  importBackup: (backup: unknown, mode: 'replace' | 'merge') =>
+    http<Env<{ mode: string; tools?: number; connections?: number; projects?: number; workspaces?: number }>>(
+      'POST', '/api/import', { backup, mode }),
 }

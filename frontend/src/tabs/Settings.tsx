@@ -1,12 +1,14 @@
-// Settings tab: local OpenAI-compatible LLM (connection, test, model choice) + global guardrails.
-import { Cpu, Download, RefreshCw, ShieldCheck, Zap } from 'lucide-react'
-import { useState } from 'react'
-import { api } from '../api'
+// Settings tab: local OpenAI-compatible LLM (connection, test, model choice) +
+// global guardrails + full backup/restore for version migrations.
 import {
-  Badge, Button, Card, Field, Input, Select, Toggle, useBusy, useToast,
+  AlertTriangle, Cpu, Download, RefreshCw, ShieldCheck, Upload, Zap,
+} from 'lucide-react'
+import { useRef, useState } from 'react'
+import { api, ApiError } from '../api'
+import {
+  Badge, Button, Card, Field, Input, Modal, Select, Toggle, cls, useBusy, useToast,
 } from '../components/ui'
 import type { TabProps } from './shared'
-import { downloadText } from './shared'
 
 const PRESETS = [
   { name: 'Ollama', url: 'http://localhost:11434/v1' },
@@ -75,9 +77,36 @@ export default function Settings({ db, apply }: TabProps) {
     toast.push('Global guardrails saved.', 'success')
   })
 
-  const exportState = () => run('export', async () => {
-    const env = await api.state()
-    downloadText('doing-mcp-state.json', JSON.stringify(env, null, 2))
+  const fileInput = useRef<HTMLInputElement>(null)
+  const [pending, setPending] = useState<{ name: string; backup: unknown; summary: string } | null>(null)
+
+  const pickFile = (file: File) => {
+    void file.text().then((text) => {
+      try {
+        const backup = JSON.parse(text) as { data?: Record<string, unknown[]> }
+        const d = (backup.data ?? backup) as Record<string, unknown[]>
+        const n = (k: string) => (Array.isArray(d[k]) ? d[k].length : 0)
+        const summary = `${n('tools')} tools · ${n('connections')} connections · ${n('projects')} projects · ${n('workspaces')} workspaces · ${n('folders')} folders`
+        setPending({ name: file.name, backup, summary })
+      } catch {
+        toast.push('That file is not a valid DOINg.MCP backup (JSON expected).', 'error')
+      }
+    })
+  }
+
+  const runImport = (mode: 'replace' | 'merge') => run('import', async () => {
+    if (!pending) return
+    try {
+      const env = await api.importBackup(pending.backup, mode)
+      apply(env)
+      setPending(null)
+      const r = env.result
+      toast.push(mode === 'replace'
+        ? `Backup restored: ${r.tools ?? 0} tools, ${r.connections ?? 0} connections, ${r.projects ?? 0} projects.`
+        : `Backup merged: +${r.tools ?? 0} tools, +${r.connections ?? 0} connections.`, 'success')
+    } catch (err) {
+      toast.push(err instanceof ApiError ? err.message : String(err), 'error')
+    }
   })
 
   return (
@@ -186,18 +215,61 @@ export default function Settings({ db, apply }: TabProps) {
             </div>
           </Card>
 
-          <Card title="Workshop data" subtitle="Everything lives in backend/db.json — no cloud.">
-            <div className="flex items-center justify-between">
+          <Card title="Backup & restore" subtitle="Save everything to a file and restore it on another version or machine.">
+            <div className="space-y-3">
               <p className="text-xs text-zinc-500">
-                Full state backup (connections without secrets, catalog, queries, tools, projects, audit).
+                The backup includes workspaces, folders, connections, catalog, saved queries,
+                tools and projects — all in one file. Perfect before upgrading the app.
               </p>
-              <Button variant="outline" size="sm" icon={Download} busy={busy === 'export'} onClick={exportState}>
-                Export state
-              </Button>
+              <input
+                ref={fileInput} type="file" accept="application/json,.json" className="hidden"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) pickFile(f); e.target.value = '' }}
+              />
+              <div className="flex gap-2">
+                <a href={api.exportBackupUrl()} download className="inline-flex">
+                  <Button variant="primary" size="sm" icon={Download}>Export backup</Button>
+                </a>
+                <Button variant="outline" size="sm" icon={Upload} onClick={() => fileInput.current?.click()}>
+                  Import backup…
+                </Button>
+              </div>
+              <div className="flex items-start gap-2 rounded-md bg-amber-50 px-2.5 py-2 text-[11px] text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+                <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+                The backup file contains your database passwords and LLM API key in clear text —
+                store it somewhere safe.
+              </div>
             </div>
           </Card>
         </div>
       </div>
+
+      {/* ----- Import confirmation ----- */}
+      <Modal
+        open={pending !== null}
+        onClose={() => setPending(null)}
+        title="Restore backup"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setPending(null)}>Cancel</Button>
+            <Button variant="outline" busy={busy === 'import'} onClick={() => runImport('merge')}>Merge</Button>
+            <Button variant="danger" busy={busy === 'import'} onClick={() => runImport('replace')}>Replace everything</Button>
+          </>
+        }
+      >
+        {pending && (
+          <div className="space-y-3 text-xs text-zinc-600 dark:text-zinc-300">
+            <p><span className="font-medium">{pending.name}</span></p>
+            <p className="font-mono text-[11px] text-zinc-500">{pending.summary}</p>
+            <div className={cls('rounded-md px-2.5 py-2', 'bg-zinc-100 dark:bg-zinc-800')}>
+              <p className="mb-1"><b>Replace everything</b> — wipe the current workspaces, tools and
+                projects and restore exactly this backup. Use this for a version migration or a clean restore.</p>
+              <p><b>Merge</b> — keep what you have and add the backup's items alongside (ids are
+                remapped, so nothing is overwritten).</p>
+            </div>
+            <p className="text-amber-600 dark:text-amber-400">Running MCP servers will be stopped during the import.</p>
+          </div>
+        )}
+      </Modal>
     </div>
   )
 }
