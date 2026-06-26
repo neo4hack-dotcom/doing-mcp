@@ -23,7 +23,7 @@ def default_db() -> dict:
         "version": 1,
         "settings": {
             "llm": {
-                "base_url": "http://localhost:11434/v1",
+                "base_url": "http://127.0.0.1:11434/v1",
                 "api_key": "",
                 "model": "",
                 "temperature": 0.2,

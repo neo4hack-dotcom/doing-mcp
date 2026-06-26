@@ -116,6 +116,19 @@ The Explorer is built to roam your data without friction:
 - **Open in SQL Studio** — seed the editor from the current table (pinned fields first). Your SQL/prompt **draft survives tab switches**, so you can pop back to the Explorer to check a value and return without losing your work. ⌘/Ctrl + Enter runs the query.
 - The active connection is remembered across Explorer ↔ SQL Studio.
 
+## Backup & restore (version migrations)
+
+Settings → **Backup & restore**:
+
+- **Export backup** downloads a single JSON with everything — workspaces, folders, connections,
+  catalog, saved queries, tools and projects — **including secrets** (DB passwords, LLM API key)
+  so the restore is immediately usable. Keep the file private.
+- **Import backup** reads that file and offers two modes:
+  - **Replace everything** — wipe and restore exactly the backup (clean migration to a new version/machine).
+  - **Merge** — append the backup's items alongside the current ones (ids are remapped, nothing is overwritten).
+- Endpoints: `GET /api/export`, `POST /api/import` ({ backup, mode }). Running MCP servers are stopped
+  during a restore. Legacy masked exports import gracefully (secrets are simply left blank).
+
 ## Workspaces & folders
 
 - **Workspaces** isolate each user's work — folders, tools, queries and projects live in the

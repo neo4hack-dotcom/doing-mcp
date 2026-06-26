@@ -28,12 +28,49 @@ def _base(llm: dict) -> str:
     return base
 
 
+_LOCALHOST_RE = re.compile(r"^(https?://)localhost(\b.*)$", re.IGNORECASE)
+_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
+                   httpx.RemoteProtocolError)
+
+
+def _candidate_bases(base: str) -> list[str]:
+    """The configured base, plus a 127.0.0.1 fallback when host is `localhost`.
+
+    Some environments can't resolve the `localhost` hostname (getaddrinfo
+    ENOTFOUND), which would make every local LLM call fail even though the
+    server is up on 127.0.0.1. We try the configured URL first, so setups that
+    genuinely rely on `localhost` (e.g. IPv6 ::1) keep working.
+    """
+    candidates = [base]
+    match = _LOCALHOST_RE.match(base)
+    if match:
+        candidates.append(match.group(1) + "127.0.0.1" + match.group(2))
+    return candidates
+
+
+def _send(method: str, llm: dict, suffix: str, **kwargs) -> httpx.Response:
+    """Send a request, transparently falling back to 127.0.0.1 on connection errors."""
+    last: Exception | None = None
+    for base in _candidate_bases(_base(llm)):
+        try:
+            return httpx.request(method, base + suffix, headers=_headers(llm), **kwargs)
+        except _CONNECT_ERRORS as exc:
+            last = exc
+            continue
+    raise LlmError(
+        f"LLM unreachable at {_base(llm)} — is the local server running and the URL correct? ({last})"
+    ) from last
+
+
 def list_models(llm: dict) -> list[str]:
     try:
-        resp = httpx.get(_base(llm) + "/models", headers=_headers(llm), timeout=15)
+        resp = _send("GET", llm, "/models", timeout=15)
         resp.raise_for_status()
         data = resp.json()
         return sorted(m.get("id", "") for m in data.get("data", []) if m.get("id"))
+    except httpx.HTTPStatusError as exc:
+        raise LlmError(f"Unable to list models: HTTP {exc.response.status_code} "
+                       f"{exc.response.text[:200]}") from exc
     except httpx.HTTPError as exc:
         raise LlmError(f"Unable to list models: {exc}") from exc
 
@@ -60,8 +97,7 @@ def chat(llm: dict, messages: list[dict], temperature: float | None = None,
         "max_tokens": max_tokens or int(llm.get("max_tokens") or 2048),
     }
     try:
-        resp = httpx.post(_base(llm) + "/chat/completions", json=payload,
-                          headers=_headers(llm), timeout=180)
+        resp = _send("POST", llm, "/chat/completions", json=payload, timeout=180)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"] or ""
@@ -86,8 +122,7 @@ def chat_with_tools(llm: dict, messages: list[dict], tools: list[dict],
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
     try:
-        resp = httpx.post(_base(llm) + "/chat/completions", json=payload,
-                          headers=_headers(llm), timeout=240)
+        resp = _send("POST", llm, "/chat/completions", json=payload, timeout=240)
         resp.raise_for_status()
         message = resp.json()["choices"][0]["message"]
         if not isinstance(message, dict):

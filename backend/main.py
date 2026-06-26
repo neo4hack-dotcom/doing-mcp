@@ -8,13 +8,14 @@ Conventions:
 """
 import contextlib
 import io
+import json
 import os
 import zipfile
 
 from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
-    FileResponse, JSONResponse, PlainTextResponse, StreamingResponse,
+    FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
 
@@ -1275,6 +1276,133 @@ def project_chat(project_id: str, payload: dict = Body(...)):
     result = chat_mod.run_chat(db["settings"]["llm"], url, messages)
     result["server"] = {"running": True, "url": url, "port": status.get("port"), "auto_started": started}
     return {"result": result}
+
+
+# ---------------------------------------------------------------- Backup & restore
+
+BACKUP_KEYS = ("settings", "workspaces", "folders", "connections", "catalog",
+               "queries", "tools", "projects")
+
+
+@app.get("/api/export")
+def export_backup():
+    """Full backup of everything (INCLUDING secrets) for migration/restore.
+
+    Unlike /api/state this keeps connection passwords and the LLM API key so the
+    restore is immediately usable. The file is sensitive — keep it private.
+    """
+    db = storage.load()
+    payload = {
+        "doing_mcp_backup": 1,
+        "exported_at": storage.now_iso(),
+        "app_version": app.version,
+        "data": {key: db[key] for key in BACKUP_KEYS},
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=1)
+    stamp = storage.now_iso().replace(":", "-")
+    return Response(content=body, media_type="application/json", headers={
+        "Content-Disposition": f'attachment; filename="doing-mcp-backup-{stamp}.json"'})
+
+
+def _sanitize_imported(db: dict) -> None:
+    for conn in db.get("connections", []):
+        conn.setdefault("password", "")  # legacy masked exports omit the password
+    llm = db["settings"]["llm"]
+    if llm.get("api_key") == storage.MASK:
+        llm["api_key"] = ""
+
+
+def _replace_import(db: dict, data: dict) -> None:
+    for key in BACKUP_KEYS:
+        if key in data and isinstance(data[key], type(storage.default_db()[key])):
+            db[key] = data[key]
+    if not db.get("workspaces"):
+        db["workspaces"] = storage.default_db()["workspaces"]
+    _sanitize_imported(db)
+    storage._merge_defaults(db)  # backfill any missing keys + stamp workspace ids
+
+
+def _merge_import(db: dict, data: dict) -> dict:
+    ws_map, conn_map, folder_map, tool_map = {}, {}, {}, {}
+    default_ws = db["workspaces"][0]["id"]
+
+    for ws in data.get("workspaces", []):
+        nid = storage.new_id("ws")
+        ws_map[ws.get("id")] = nid
+        db["workspaces"].append({**ws, "id": nid,
+                                 "name": (ws.get("name") or "Imported") + " (import)",
+                                 "created_at": storage.now_iso()})
+
+    def mws(old):
+        return ws_map.get(old, default_ws)
+
+    for conn in data.get("connections", []):
+        nid = storage.new_id("conn")
+        conn_map[conn.get("id")] = nid
+        new_conn = {**conn, "id": nid}
+        new_conn.setdefault("password", "")
+        db["connections"].append(new_conn)
+        cat = (data.get("catalog") or {}).get(conn.get("id"))
+        if cat:
+            db["catalog"][nid] = cat
+
+    def mconn(old):
+        return conn_map.get(old, old)
+
+    for folder in data.get("folders", []):
+        nid = storage.new_id("fld")
+        folder_map[folder.get("id")] = nid
+        db["folders"].append({**folder, "id": nid, "workspace_id": mws(folder.get("workspace_id"))})
+
+    for query in data.get("queries", []):
+        db["queries"].append({**query, "id": storage.new_id("qry"),
+                              "connection_id": mconn(query.get("connection_id")),
+                              "workspace_id": mws(query.get("workspace_id"))})
+
+    for tool in data.get("tools", []):
+        nid = storage.new_id("tool")
+        tool_map[tool.get("id")] = nid
+        db["tools"].append({**tool, "id": nid,
+                            "connection_id": mconn(tool.get("connection_id")),
+                            "workspace_id": mws(tool.get("workspace_id")),
+                            "folder_id": folder_map.get(tool.get("folder_id"))})
+
+    for project in data.get("projects", []):
+        db["projects"].append({**project, "id": storage.new_id("proj"),
+                               "slug": unique_slug(db, project.get("name", "Imported")),
+                               "workspace_id": mws(project.get("workspace_id")),
+                               "tool_ids": [tool_map[t] for t in project.get("tool_ids", [])
+                                            if t in tool_map],
+                               "generated_at": None})
+    return {"connections": len(conn_map), "tools": len(tool_map),
+            "workspaces": len(ws_map), "folders": len(folder_map)}
+
+
+@app.post("/api/import")
+def import_backup(payload: dict = Body(...),
+                  x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    """Restore a full backup. mode='replace' (default) wipes & restores everything;
+    mode='merge' appends the backup alongside existing data (ids remapped)."""
+    with mutation(x_base_version) as db:
+        backup = payload.get("backup") or payload
+        data = backup.get("data") if isinstance(backup.get("data"), dict) else backup
+        if not isinstance(data, dict) or "tools" not in data:
+            raise HTTPException(400, "Invalid backup file (missing « data » / « tools »).")
+        mode = "merge" if payload.get("mode") == "merge" else "replace"
+        runner.stop_all()  # generated servers reference ids that are about to change
+        if mode == "merge":
+            counts = _merge_import(db, data)
+            detail = (f"merged {counts['tools']} tools, {counts['connections']} connections, "
+                      f"{counts['workspaces']} workspaces")
+            result = {"mode": mode, **counts}
+        else:
+            _replace_import(db, data)
+            detail = (f"replaced with {len(db['tools'])} tools, {len(db['connections'])} connections, "
+                      f"{len(db['projects'])} projects")
+            result = {"mode": mode, "tools": len(db["tools"]),
+                      "connections": len(db["connections"]), "projects": len(db["projects"])}
+        storage.audit(db, "backup.import", detail, "warn")
+        return envelope(db, result)
 
 
 # ---------------------------------------------------------------- Audit
