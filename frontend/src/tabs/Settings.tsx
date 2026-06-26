@@ -10,11 +10,13 @@ import {
 } from '../components/ui'
 import type { TabProps } from './shared'
 
+// 127.0.0.1 rather than "localhost": some environments can't resolve the
+// localhost hostname. The backend also falls back automatically if needed.
 const PRESETS = [
-  { name: 'Ollama', url: 'http://localhost:11434/v1' },
-  { name: 'LM Studio', url: 'http://localhost:1234/v1' },
-  { name: 'vLLM', url: 'http://localhost:8000/v1' },
-  { name: 'llama.cpp', url: 'http://localhost:8080/v1' },
+  { name: 'Ollama', url: 'http://127.0.0.1:11434/v1' },
+  { name: 'LM Studio', url: 'http://127.0.0.1:1234/v1' },
+  { name: 'vLLM', url: 'http://127.0.0.1:8000/v1' },
+  { name: 'llama.cpp', url: 'http://127.0.0.1:8080/v1' },
 ]
 
 export default function Settings({ db, apply }: TabProps) {
@@ -142,7 +144,7 @@ export default function Settings({ db, apply }: TabProps) {
               ))}
             </div>
             <Field label="Base URL (OpenAI compatible)">
-              <Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="http://localhost:11434/v1" className="font-mono text-xs" />
+              <Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="http://127.0.0.1:11434/v1" className="font-mono text-xs" />
             </Field>
             <div className="grid grid-cols-2 gap-3">
               <Field label="API key" hint={llm.api_key_set ? 'A key is saved — type to replace it.' : 'Often unnecessary locally.'}>
