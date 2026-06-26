@@ -75,6 +75,11 @@ discovers its tools over the real MCP protocol, **calls them** (tool calls are s
 **live data from your database**. Nothing leaves your machine — only the local LLM and the `127.0.0.1` MCP server
 are contacted. The LLM must support OpenAI tool/function calling (most do via Ollama, LM Studio, vLLM).
 
+Answers are rendered with a built-in, dependency-free **Markdown + safe-HTML** renderer (GFM tables, code
+blocks, lists, headings, bold/italic, links, blockquotes, and a whitelisted subset of raw HTML). It renders
+to React elements — never `dangerouslySetInnerHTML` — so model output that echoes database values can't inject
+scripts.
+
 ## Features (beyond the brief)
 
 1. **Built-in demo sandbox** (in-memory SQLite) — pipeline testable without ClickHouse/Oracle.

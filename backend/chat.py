@@ -17,7 +17,9 @@ SYSTEM_PROMPT = (
     "ONLY the data returned by the available tools — never invent values. "
     "When you are unsure which table or column to use, call `catalog_search` first. "
     "Choose the most relevant tool, pass the required parameters, then summarize the result clearly. "
-    "When the result is tabular, render a small Markdown table. "
+    "Format every answer in clean GitHub-flavored Markdown for readability: use **bold** for key "
+    "figures, bullet lists for breakdowns, and ALWAYS present tabular results as a Markdown table "
+    "(| col | col | with a |---|---| separator row). Use `code` for identifiers and column names. "
     "Reply in the same language as the user. Be concise and factual."
 )
 
