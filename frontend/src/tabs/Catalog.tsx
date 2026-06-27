@@ -9,7 +9,7 @@ import { useMemo, useState } from 'react'
 import { api } from '../api'
 import DataBrowser from '../components/DataBrowser'
 import { PinnedFields, ResultsTable, SchemaTree, columnPinKey, tableKey } from '../components/data'
-import { Badge, Button, Card, EmptyState, Select, cls, useBusy, useToast } from '../components/ui'
+import { Badge, Button, Card, EmptyState, Input, Select, cls, useBusy, useToast } from '../components/ui'
 import type { RunOutcome, TableInfo, TableProfile } from '../types'
 import type { TabProps } from './shared'
 import { rememberConn, rememberedConn } from './shared'
@@ -117,6 +117,15 @@ export default function Catalog({ db, apply, goTo, pins, togglePin }: TabProps) 
     goTo('tools')
   })
 
+  const persistCatalog = async (patch: { description?: string; columns?: { name: string; description?: string; pii?: boolean }[] }) => {
+    if (!conn || !table) return
+    try {
+      apply(await api.updateCatalog(conn.id, table.schema, table.name, patch))
+    } catch (err) {
+      toast.push(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
+
   const openInStudio = () => {
     if (!conn || !table) return
     const pinned = table.columns.filter((c) => pins.includes(columnPinKey(table, c)))
@@ -195,6 +204,16 @@ export default function Catalog({ db, apply, goTo, pins, togglePin }: TabProps) 
                   </>
                 }
               >
+                <div className="mb-3">
+                  <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-zinc-400">Table description (editable)</label>
+                  <Input
+                    key={`tdesc-${tableKey(table)}`}
+                    defaultValue={table.description ?? ''}
+                    placeholder="Describe this table… (saved to the catalog, no LLM needed)"
+                    className="text-xs"
+                    onBlur={(e) => { if (e.target.value !== (table.description ?? '')) void persistCatalog({ description: e.target.value }) }}
+                  />
+                </div>
                 <div className="max-h-80 overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-700">
                   <table className="w-full text-left text-xs">
                     <thead className="sticky top-0 bg-zinc-50 dark:bg-zinc-800">
@@ -202,7 +221,8 @@ export default function Catalog({ db, apply, goTo, pins, togglePin }: TabProps) 
                         <th className="w-7 px-2 py-1.5" title="Pin fields to reuse them in the SQL Studio" />
                         <th className="px-2.5 py-1.5 font-semibold text-zinc-600 dark:text-zinc-300">Column</th>
                         <th className="px-2.5 py-1.5 font-semibold text-zinc-600 dark:text-zinc-300">Type</th>
-                        <th className="px-2.5 py-1.5 font-semibold text-zinc-600 dark:text-zinc-300">Description (AI)</th>
+                        <th className="w-12 px-2 py-1.5 text-center font-semibold text-zinc-600 dark:text-zinc-300" title="Toggle PII">PII</th>
+                        <th className="px-2.5 py-1.5 font-semibold text-zinc-600 dark:text-zinc-300">Description (editable)</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -230,8 +250,24 @@ export default function Catalog({ db, apply, goTo, pins, togglePin }: TabProps) 
                             {col.pii && <Badge tone="red" className="ml-1.5">PII</Badge>}
                           </td>
                           <td className="whitespace-nowrap px-2.5 py-1.5 font-mono text-[11px] text-zinc-500">{col.type}</td>
-                          <td className="px-2.5 py-1.5 text-zinc-600 dark:text-zinc-300">
-                            {col.description || col.comment || <span className="italic text-zinc-400">—</span>}
+                          <td className="px-2 py-1.5 text-center">
+                            <button
+                              onClick={() => void persistCatalog({ columns: [{ name: col.name, pii: !col.pii }] })}
+                              className={cls('inline-flex h-4 w-4 items-center justify-center rounded border text-[9px] font-bold',
+                                col.pii ? 'border-red-400 bg-red-500 text-white' : 'border-zinc-300 text-transparent hover:border-red-400 dark:border-zinc-600')}
+                              title={col.pii ? 'Marked as PII — click to clear' : 'Mark as PII'}
+                            >
+                              ✓
+                            </button>
+                          </td>
+                          <td className="px-1.5 py-1">
+                            <Input
+                              key={`cdesc-${tableKey(table)}-${col.name}`}
+                              defaultValue={col.description ?? ''}
+                              placeholder="—"
+                              className="!border-transparent !bg-transparent !px-1.5 !py-0.5 text-[11px] hover:!border-zinc-300 focus:!border-brand-500 dark:hover:!border-zinc-600"
+                              onBlur={(e) => { if (e.target.value !== (col.description ?? '')) void persistCatalog({ columns: [{ name: col.name, description: e.target.value }] }) }}
+                            />
                           </td>
                         </tr>
                         )

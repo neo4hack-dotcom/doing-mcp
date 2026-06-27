@@ -4,6 +4,7 @@ import { Bot, ChevronDown, ChevronRight, Cpu, Send, User, Wrench } from 'lucide-
 import { useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '../api'
 import type { AppData, ChatStep, ChatTurn, Project } from '../types'
+import { Markdown } from './markdown'
 import { Badge, Button, Spinner, Textarea, cls } from './ui'
 
 const SUGGESTIONS = [
@@ -117,12 +118,14 @@ export default function ProjectChat({ project, db }: { project: Project; db: App
                 </div>
               )}
               <div className={cls(
-                'whitespace-pre-wrap rounded-lg px-3 py-2 text-xs leading-relaxed',
+                'rounded-lg px-3 py-2 text-xs leading-relaxed',
                 turn.role === 'user'
-                  ? 'bg-brand-600 text-white'
+                  ? 'whitespace-pre-wrap bg-brand-600 text-white'
                   : 'bg-white text-zinc-700 shadow-sm dark:bg-zinc-800 dark:text-zinc-200',
               )}>
-                {turn.content || <span className="italic text-zinc-400">(no text)</span>}
+                {turn.role === 'assistant'
+                  ? (turn.content ? <Markdown content={turn.content} /> : <span className="italic text-zinc-400">(no text)</span>)
+                  : turn.content}
               </div>
             </div>
             {turn.role === 'user' && <User size={16} className="mt-1 shrink-0 text-zinc-400" />}

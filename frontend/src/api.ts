@@ -106,6 +106,9 @@ export const api = {
   introspect: (id: string) => http<Env<{ tables: number }>>('POST', `/api/connections/${id}/introspect`),
   enrich: (id: string, table_keys?: string[]) =>
     http<Env<{ enriched: number; failed: string[] }>>('POST', `/api/connections/${id}/enrich`, { table_keys }),
+  updateCatalog: (id: string, schema: string, table: string,
+                  patch: { description?: string; columns?: { name: string; description?: string; pii?: boolean }[] }) =>
+    http<Env<{ ok: boolean }>>('PUT', `/api/connections/${id}/catalog`, { schema, table, ...patch }),
   browseTable: (id: string, schema: string, table: string, filters: BrowseFilter[],
                 sort: BrowseSort | null, limit: number) =>
     http<{ result: RunOutcome }>('POST', `/api/connections/${id}/browse`,

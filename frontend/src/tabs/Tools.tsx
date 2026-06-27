@@ -12,9 +12,9 @@ import {
   Toggle, cls, useBusy, useConfirm, useToast,
 } from '../components/ui'
 import type {
-  ParamType, RowPolicy, RunOutcome, SecurityReview, ToolDef, ToolParam,
+  FlexSpec, ParamType, RowPolicy, RunOutcome, SecurityReview, ToolDef, ToolParam,
 } from '../types'
-import { EMPTY_POLICY, dialectOf } from '../types'
+import { EMPTY_FLEX, EMPTY_POLICY, FLEX_AGGREGATES, dialectOf } from '../types'
 import type { TabProps } from './shared'
 import { detectParams } from './shared'
 
@@ -34,6 +34,7 @@ interface ToolForm {
   folder_id: string | null
   security_review: SecurityReview | null
   row_policy: RowPolicy
+  flex: FlexSpec
 }
 
 const PARAM_TYPES: ParamType[] = ['string', 'integer', 'number', 'boolean', 'date']
@@ -44,6 +45,7 @@ function emptyForm(connId: string, folderId: string | null = null): ToolForm {
     sql: '', params: [], max_rows: '500', timeout_s: '30', rate_per_min: '120',
     masked_columns: '', tags: '', folder_id: folderId, security_review: null,
     row_policy: { ...EMPTY_POLICY, rules: [] },
+    flex: { ...EMPTY_FLEX },
   }
 }
 
@@ -163,6 +165,9 @@ export default function Tools({ db, apply, goTo }: TabProps) {
     row_policy: tool.row_policy
       ? { ...tool.row_policy, rules: tool.row_policy.rules.map((r) => ({ ...r })) }
       : { ...EMPTY_POLICY, rules: [] },
+    flex: tool.flex
+      ? { ...EMPTY_FLEX, ...tool.flex, dimensions: [...tool.flex.dimensions], metrics: [...tool.flex.metrics], filters: [...tool.flex.filters], aggregates: [...tool.flex.aggregates] }
+      : { ...EMPTY_FLEX },
   })
 
   const suggest = () => form && run('suggest', async () => {
@@ -201,6 +206,7 @@ export default function Tools({ db, apply, goTo }: TabProps) {
       tags: form.tags.split(',').map((s) => s.trim()).filter(Boolean),
       folder_id: form.folder_id,
       security_review: form.security_review,
+      flex: form.flex,
       row_policy: {
         ...form.row_policy,
         rules: form.row_policy.rules
@@ -348,6 +354,7 @@ export default function Tools({ db, apply, goTo }: TabProps) {
                       {tool.row_policy?.enabled && tool.row_policy.rules.length > 0 && (
                         <Badge tone="amber"><Lock size={10} /> RLS</Badge>
                       )}
+                      {tool.flex?.enabled && tool.flex.table && <Badge tone="green"><Zap size={10} /> flexible</Badge>}
                     </div>
                     <p className="mt-1 line-clamp-2 text-xs text-zinc-500 dark:text-zinc-400">{tool.description || '(no description)'}</p>
                   </div>
@@ -393,7 +400,8 @@ export default function Tools({ db, apply, goTo }: TabProps) {
         footer={
           <>
             <Button variant="outline" onClick={() => setForm(null)}>Cancel</Button>
-            <Button busy={busy === 'save'} onClick={submit} disabled={!form?.sql.trim() || !form?.name.trim()}>
+            <Button busy={busy === 'save'} onClick={submit}
+              disabled={!form?.name.trim() || (form?.flex.enabled ? !form?.flex.table : !form?.sql.trim())}>
               {form?.id ? 'Save' : 'Create tool'}
             </Button>
           </>
@@ -401,18 +409,20 @@ export default function Tools({ db, apply, goTo }: TabProps) {
       >
         {form && (
           <div className="space-y-4">
-            <div className="flex flex-wrap justify-end gap-2">
-              <Button size="sm" variant="outline" icon={Sparkles} busy={busy === 'suggest'} onClick={suggest} disabled={!form.sql.trim()}>
-                Suggest the contract with AI
-              </Button>
-              <Button size="sm" variant="outline" icon={Zap} busy={busy === 'enhance'} onClick={enhance} disabled={!form.sql.trim()}
-                title="Rewrite the query with optional filters and dialect-specific power features">
-                Make versatile
-              </Button>
-              <Button size="sm" variant="outline" icon={ShieldAlert} busy={busy === 'review'} onClick={review} disabled={!form.sql.trim()}>
-                AI security review
-              </Button>
-            </div>
+            {!form.flex.enabled && (
+              <div className="flex flex-wrap justify-end gap-2">
+                <Button size="sm" variant="outline" icon={Sparkles} busy={busy === 'suggest'} onClick={suggest} disabled={!form.sql.trim()}>
+                  Suggest the contract with AI
+                </Button>
+                <Button size="sm" variant="outline" icon={Zap} busy={busy === 'enhance'} onClick={enhance} disabled={!form.sql.trim()}
+                  title="Rewrite the query with optional filters and dialect-specific power features">
+                  Make versatile
+                </Button>
+                <Button size="sm" variant="outline" icon={ShieldAlert} busy={busy === 'review'} onClick={review} disabled={!form.sql.trim()}>
+                  AI security review
+                </Button>
+              </div>
+            )}
             <div className="grid grid-cols-3 gap-3">
               <Field label="Name (snake_case)">
                 <Input value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="top_customers_by_revenue" className="font-mono" />
@@ -432,36 +442,133 @@ export default function Tools({ db, apply, goTo }: TabProps) {
             <Field label="Description for the AI agent" hint="When to use this tool, what it returns — this is the doc the client LLM will read.">
               <Textarea value={form.description} onChange={(e) => set({ description: e.target.value })} rows={2} />
             </Field>
-            <Field label="SQL (:name parameters)">
-              <Textarea
-                value={form.sql}
-                onChange={(e) => { const sql = e.target.value; set({ sql, params: syncParams(sql, form.params) }) }}
-                rows={5} spellCheck={false} className="font-mono text-xs"
-              />
-            </Field>
 
-            {form.params.length > 0 && (
-              <div>
-                <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-zinc-400">Parameters ({form.params.length})</p>
-                <div className="space-y-2">
-                  {form.params.map((param, index) => (
-                    <div key={param.name} className="grid grid-cols-12 items-center gap-2 rounded-lg border border-zinc-200 p-2 dark:border-zinc-700">
-                      <span className="col-span-2 truncate font-mono text-xs font-medium text-brand-600 dark:text-brand-400">:{param.name}</span>
-                      <Select value={param.type} onChange={(e) => updateParam(index, { type: e.target.value as ParamType })} className="col-span-2 !py-1 text-xs">
-                        {PARAM_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+            {/* ----- Flexible tool builder ----- */}
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-3 dark:border-emerald-900/60 dark:bg-emerald-950/20">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Zap size={14} className="text-emerald-600" />
+                  <span className="text-xs font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+                    Flexible tool (fields / aggregate / filters chosen at call time)
+                  </span>
+                </div>
+                <Toggle
+                  checked={form.flex.enabled}
+                  onChange={(enabled) => set({ flex: { ...form.flex, enabled } })}
+                  label={form.flex.enabled ? 'on' : 'off'}
+                />
+              </div>
+              {form.flex.enabled && (() => {
+                const tables = db.catalog[form.connection_id]?.tables ?? []
+                const current = tables.find((t) => t.schema === form.flex.schema && t.name === form.flex.table)
+                const cols = current?.columns.map((c) => c.name) ?? []
+                const toggle = (key: 'dimensions' | 'metrics' | 'filters', col: string) => set({
+                  flex: { ...form.flex, [key]: form.flex[key].includes(col) ? form.flex[key].filter((c) => c !== col) : [...form.flex[key], col] },
+                })
+                const colGrid = (key: 'dimensions' | 'metrics' | 'filters', label: string, hint: string) => (
+                  <div>
+                    <p className="mb-1 text-[11px] font-medium text-zinc-500">{label} <span className="text-zinc-400">— {hint}</span></p>
+                    {cols.length === 0 ? <p className="text-[11px] text-zinc-400">Pick a table first.</p> : (
+                      <div className="flex max-h-28 flex-wrap gap-1 overflow-y-auto">
+                        {cols.map((c) => (
+                          <button key={c} type="button" onClick={() => toggle(key, c)}
+                            className={cls('rounded-md border px-1.5 py-0.5 font-mono text-[10.5px]',
+                              form.flex[key].includes(c)
+                                ? 'border-emerald-400 bg-emerald-500 text-white'
+                                : 'border-zinc-300 text-zinc-600 hover:border-emerald-400 dark:border-zinc-600 dark:text-zinc-300')}>
+                            {c}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+                return (
+                  <div className="mt-3 space-y-3">
+                    <p className="text-[11px] text-zinc-500">
+                      The agent picks which fields to return, an optional metric + aggregate, equality filters and
+                      sorting — assembled from the whitelist below (injection-proof). No SQL to write.
+                    </p>
+                    <Field label="Base table">
+                      <Select
+                        value={form.flex.table ? `${form.flex.schema}.${form.flex.table}` : ''}
+                        onChange={(e) => {
+                          const t = tables.find((x) => `${x.schema}.${x.name}` === e.target.value)
+                          set({ flex: { ...form.flex, schema: t?.schema ?? '', table: t?.name ?? '', dimensions: [], metrics: [], filters: [] } })
+                        }}
+                      >
+                        <option value="">Select a table…</option>
+                        {tables.map((t) => <option key={`${t.schema}.${t.name}`} value={`${t.schema}.${t.name}`}>{t.schema}.{t.name}</option>)}
                       </Select>
-                      <Input value={param.description} onChange={(e) => updateParam(index, { description: e.target.value })}
-                        placeholder="description for the agent" className="col-span-4 !py-1 text-xs" />
-                      <Input value={param.default === null || param.default === undefined ? '' : String(param.default)}
-                        onChange={(e) => updateParam(index, { default: e.target.value || null })}
-                        placeholder="default" className="col-span-2 !py-1 text-xs" />
-                      <div className="col-span-2">
-                        <Toggle checked={param.required} onChange={(required) => updateParam(index, { required })} label="required" />
+                    </Field>
+                    {colGrid('dimensions', 'Dimensions', 'selectable / group-by columns')}
+                    {colGrid('metrics', 'Metrics', 'numeric columns that can be aggregated')}
+                    {colGrid('filters', 'Filters', 'columns exposed as optional equality filters')}
+                    <div>
+                      <p className="mb-1 text-[11px] font-medium text-zinc-500">Allowed aggregates</p>
+                      <div className="flex flex-wrap gap-1">
+                        {FLEX_AGGREGATES.map((a) => (
+                          <button key={a} type="button"
+                            onClick={() => set({ flex: { ...form.flex, aggregates: form.flex.aggregates.includes(a) ? form.flex.aggregates.filter((x) => x !== a) : [...form.flex.aggregates, a] } })}
+                            className={cls('rounded-md border px-1.5 py-0.5 font-mono text-[10.5px]',
+                              form.flex.aggregates.includes(a)
+                                ? 'border-emerald-400 bg-emerald-500 text-white'
+                                : 'border-zinc-300 text-zinc-600 hover:border-emerald-400 dark:border-zinc-600 dark:text-zinc-300')}>
+                            {a}
+                          </button>
+                        ))}
                       </div>
                     </div>
-                  ))}
-                </div>
-              </div>
+                    <div className="grid grid-cols-3 gap-3">
+                      <Field label="Default limit">
+                        <Input value={String(form.flex.default_limit)} onChange={(e) => set({ flex: { ...form.flex, default_limit: parseInt(e.target.value, 10) || 100 } })} />
+                      </Field>
+                      <Field label="Max limit">
+                        <Input value={String(form.flex.max_limit)} onChange={(e) => set({ flex: { ...form.flex, max_limit: parseInt(e.target.value, 10) || 1000 } })} />
+                      </Field>
+                      <Field label="Allow sorting">
+                        <Toggle checked={form.flex.allow_order} onChange={(v) => set({ flex: { ...form.flex, allow_order: v } })} label={form.flex.allow_order ? 'yes' : 'no'} />
+                      </Field>
+                    </div>
+                  </div>
+                )
+              })()}
+            </div>
+
+            {!form.flex.enabled && (
+              <>
+                <Field label="SQL (:name parameters)">
+                  <Textarea
+                    value={form.sql}
+                    onChange={(e) => { const sql = e.target.value; set({ sql, params: syncParams(sql, form.params) }) }}
+                    rows={5} spellCheck={false} className="font-mono text-xs"
+                  />
+                </Field>
+
+                {form.params.length > 0 && (
+                  <div>
+                    <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-zinc-400">Parameters ({form.params.length})</p>
+                    <div className="space-y-2">
+                      {form.params.map((param, index) => (
+                        <div key={param.name} className="grid grid-cols-12 items-center gap-2 rounded-lg border border-zinc-200 p-2 dark:border-zinc-700">
+                          <span className="col-span-2 truncate font-mono text-xs font-medium text-brand-600 dark:text-brand-400">:{param.name}</span>
+                          <Select value={param.type} onChange={(e) => updateParam(index, { type: e.target.value as ParamType })} className="col-span-2 !py-1 text-xs">
+                            {PARAM_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                          </Select>
+                          <Input value={param.description} onChange={(e) => updateParam(index, { description: e.target.value })}
+                            placeholder="description for the agent" className="col-span-4 !py-1 text-xs" />
+                          <Input value={param.default === null || param.default === undefined ? '' : String(param.default)}
+                            onChange={(e) => updateParam(index, { default: e.target.value || null })}
+                            placeholder="default" className="col-span-2 !py-1 text-xs" />
+                          <div className="col-span-2">
+                            <Toggle checked={param.required} onChange={(required) => updateParam(index, { required })} label="required" />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
 
             <div className="grid grid-cols-3 gap-3">

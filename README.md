@@ -75,6 +75,11 @@ discovers its tools over the real MCP protocol, **calls them** (tool calls are s
 **live data from your database**. Nothing leaves your machine — only the local LLM and the `127.0.0.1` MCP server
 are contacted. The LLM must support OpenAI tool/function calling (most do via Ollama, LM Studio, vLLM).
 
+Answers are rendered with a built-in, dependency-free **Markdown + safe-HTML** renderer (GFM tables, code
+blocks, lists, headings, bold/italic, links, blockquotes, and a whitelisted subset of raw HTML). It renders
+to React elements — never `dangerouslySetInnerHTML` — so model output that echoes database values can't inject
+scripts.
+
 ## Features (beyond the brief)
 
 1. **Built-in demo sandbox** (in-memory SQLite) — pipeline testable without ClickHouse/Oracle.
@@ -137,6 +142,22 @@ Settings → **Backup & restore**:
   workspace is sent as an `X-Workspace` header and stamped on every created item.
 - **Folders** group tools into customizable, color-tagged buckets (per workspace). Filter the
   tool list by folder, move a tool from its card, or assign it in the editor.
+
+## Editable data dictionary
+
+Catalog documentation is saved in `db.json` and survives reloads and re-introspection — the LLM
+only runs when you ask. In the Explorer you can **edit everything by hand**: the table description,
+each column's description, and the PII flag (one click). `PUT /api/connections/{id}/catalog` persists
+the edits; AI enrichment and manual edits coexist.
+
+## Flexible tools (fields / aggregates / filters at call time)
+
+Beyond fixed SQL and optional filters, a tool can be made **flexible**: at creation you whitelist a
+base table's **dimensions**, **metrics**, **aggregates** (count/sum/avg/min/max) and **filters**; at
+call time the agent chooses what to return — which fields, an optional `metric` + `aggregate`,
+equality filters, `order_by`/`order_dir` and `limit`. The server assembles the SQL from the whitelist
+only (identifiers validated, values bound) — **injection-proof**, no SQL to write. The same builder is
+compiled into the generated server, so one flexible tool replaces dozens of fixed variants.
 
 ## ClickHouse flexibility & versatile tools
 
