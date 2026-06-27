@@ -196,6 +196,71 @@ def _rls_apply(sql: str, kind: str, policy: dict, identity) -> tuple:
             params)
 
 
+def _flex_ref(kind, schema, table):
+    if kind == "demo":
+        return '"' + table + '"'
+    return '"' + schema + '"."' + table + '"'
+
+
+def _flex_build(spec, kind, args):
+    """Assemble a SELECT from the caller's whitelisted field/aggregate/filter choices."""
+    args = args or {}
+    dims_allowed = list(spec.get("dimensions", []))
+    metrics_allowed = set(spec.get("metrics", []))
+    aggs_allowed = set(spec.get("aggregates", []))
+    requested = [d.strip() for d in str(args.get("dimensions") or "").split(",") if d.strip()]
+    bad = [d for d in requested if d not in dims_allowed]
+    if bad:
+        raise ValueError("Unknown dimension(s): " + ", ".join(bad))
+    dims = [d for d in dims_allowed if d in requested]
+    select = ['"' + d + '"' for d in dims]
+    has_agg = False
+    metric = str(args.get("metric") or "").strip()
+    agg = str(args.get("aggregate") or "").strip().lower()
+    if metric:
+        if metric not in metrics_allowed:
+            raise ValueError("Unknown metric: " + metric)
+        if not agg:
+            agg = "sum"
+        if agg not in aggs_allowed:
+            raise ValueError("Aggregate not allowed: " + agg)
+        select.append(agg.upper() + '("' + metric + '") AS "' + agg + "_" + metric + '"')
+        has_agg = True
+    elif agg == "count":
+        if "count" not in aggs_allowed:
+            raise ValueError("Aggregate not allowed: count")
+        select.append('COUNT(*) AS "count"')
+        has_agg = True
+    if not select:
+        select = ["*"]
+    where, params = [], {}
+    for i, col in enumerate(spec.get("filters", [])):
+        value = args.get(col)
+        if value not in (None, ""):
+            where.append('"' + col + '" = :flt_' + str(i))
+            params["flt_" + str(i)] = value
+    sql = "SELECT " + ", ".join(select) + " FROM " + _flex_ref(kind, spec.get("schema", ""), spec.get("table", ""))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    if has_agg and dims:
+        sql += " GROUP BY " + ", ".join('"' + d + '"' for d in dims)
+    order_by = str(args.get("order_by") or "").strip()
+    if spec.get("allow_order", True) and order_by:
+        valid = set(dims_allowed) | metrics_allowed | {"count"} | set(
+            a + "_" + m for a in aggs_allowed for m in metrics_allowed)
+        if order_by not in valid:
+            raise ValueError("Cannot order by: " + order_by)
+        direction = "DESC" if str(args.get("order_dir") or "asc").lower().startswith("desc") else "ASC"
+        sql += ' ORDER BY "' + order_by + '" ' + direction
+    try:
+        limit = int(args.get("limit") or spec.get("default_limit", 100))
+    except (TypeError, ValueError):
+        limit = spec.get("default_limit", 100)
+    limit = max(1, min(limit, spec.get("max_limit", 1000)))
+    sql += ("\\nFETCH FIRST " + str(limit) + " ROWS ONLY") if kind == "oracle" else ("\\nLIMIT " + str(limit))
+    return sql, params
+
+
 def _execute(conn_name: str, sql: str, params: dict, max_rows: int,
              timeout_s: int, masked: list, policy: dict | None = None,
              identity=None, required: list | None = None) -> dict:
@@ -381,6 +446,7 @@ def generate_server_py(db: dict, project: dict) -> str:
     sql_map = {}
     rls_map = {}
     used_names: set[str] = set()
+    flex_map: dict = {}
     tool_blocks: list[str] = []
     for tool in tools:
         name = py_ident(tool["name"])
@@ -390,8 +456,14 @@ def generate_server_py(db: dict, project: dict) -> str:
         conn = conns[tool["connection_id"]]
         sql_map[name] = tool["sql"]
         gr = tool.get("guardrails", {})
+        flex_spec = tool.get("flex") or {}
+        flexible = bool(flex_spec.get("enabled")) and bool(flex_spec.get("table"))
         params = list(tool.get("params", []))
+        flex_params = list(params)  # the flexible selection params (before identity)
         desc = (tool.get("description") or tool["name"]).strip()
+        if flexible:
+            flex_map[name] = flex_spec
+            desc += " Flexible tool: choose dimensions/metric/aggregate/filters/order at call time."
 
         policy = tool.get("row_policy") or {}
         rls_on = bool(policy.get("enabled")) and bool(policy.get("rules"))
@@ -406,19 +478,24 @@ def generate_server_py(db: dict, project: dict) -> str:
             desc += f" Requires `{identity_arg}` (caller identity): results are filtered by the row-level policy."
 
         signature = build_signature(params)
-        arg_names = [py_ident(p["name"]) for p in params]
-        params_dict = "{" + ", ".join(f'"{a}": {a}' for a in arg_names) + "}"
-        required = [py_ident(p["name"]) for p in params
+        params_dict = "{" + ", ".join(f'{json.dumps(p["name"])}: {py_ident(p["name"])}' for p in params) + "}"
+        flex_args = "{" + ", ".join(f'{json.dumps(p["name"])}: {py_ident(p["name"])}' for p in flex_params) + "}"
+        required = [p["name"] for p in params
                     if p.get("required", True) and py_ident(p["name"]) != identity_arg]
 
-        block = []
-        block.append(f"@mcp.tool(name={json.dumps(name)}, description={json.dumps(desc, ensure_ascii=False)})")
-        block.append(f"def {name}({signature}) -> dict:")
-        block.append(f"    _rate({json.dumps(name)}, {int(gr.get('rate_per_min', 120))})")
-        block.append(f"    return _execute({json.dumps(conn_key(conn))}, _SQL[{json.dumps(name)}], {params_dict},")
+        block = [f"@mcp.tool(name={json.dumps(name)}, description={json.dumps(desc, ensure_ascii=False)})",
+                 f"def {name}({signature}) -> dict:",
+                 f"    _rate({json.dumps(name)}, {int(gr.get('rate_per_min', 120))})"]
+        if flexible:
+            block.append(f"    _q, _p = _flex_build(_FLEX[{json.dumps(name)}], "
+                         f"CONNECTIONS[{json.dumps(conn_key(conn))}][\"kind\"], {flex_args})")
+            sql_ref, params_ref, required_ref = "_q", "_p", "[]"
+        else:
+            sql_ref, params_ref, required_ref = f"_SQL[{json.dumps(name)}]", params_dict, json.dumps(required)
+        block.append(f"    return _execute({json.dumps(conn_key(conn))}, {sql_ref}, {params_ref},")
         block.append(f"                    max_rows={int(gr.get('max_rows', 500))}, timeout_s={int(gr.get('timeout_s', 30))},")
         block.append(f"                    masked={json.dumps(gr.get('masked_columns', []), ensure_ascii=False)},")
-        block.append(f"                    required={json.dumps(required)},")
+        block.append(f"                    required={required_ref},")
         if rls_on:
             block.append(f"                    policy=_RLS[{json.dumps(name)}], identity={identity_arg})")
         else:
@@ -427,6 +504,7 @@ def generate_server_py(db: dict, project: dict) -> str:
 
     lines.append(embed("_SQL", sql_map))
     lines.append(embed("_RLS", rls_map))
+    lines.append(embed("_FLEX", flex_map))
 
     instructions = (project.get("description") or project["name"]) + \
         " — read-only data server. Use the doing://catalog resource " \

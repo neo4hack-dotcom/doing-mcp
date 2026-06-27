@@ -134,6 +134,27 @@ export interface Folder {
   created_at: string
 }
 
+export interface FlexSpec {
+  enabled: boolean
+  schema: string
+  table: string
+  dimensions: string[]
+  metrics: string[]
+  aggregates: string[]
+  filters: string[]
+  allow_order: boolean
+  default_limit: number
+  max_limit: number
+}
+
+export const FLEX_AGGREGATES = ['count', 'sum', 'avg', 'min', 'max']
+
+export const EMPTY_FLEX: FlexSpec = {
+  enabled: false, schema: '', table: '', dimensions: [], metrics: [],
+  aggregates: ['count', 'sum', 'avg', 'min', 'max'], filters: [],
+  allow_order: true, default_limit: 100, max_limit: 1000,
+}
+
 export interface ToolDef {
   id: string
   name: string
@@ -144,6 +165,7 @@ export interface ToolDef {
   params: ToolParam[]
   guardrails: ToolGuardrails
   row_policy?: RowPolicy
+  flex?: FlexSpec
   workspace_id?: string
   folder_id?: string | null
   tags: string[]

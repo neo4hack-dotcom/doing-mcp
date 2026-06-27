@@ -29,6 +29,7 @@ DIST_DIR = os.environ.get(
 import chat as chat_mod
 import codegen
 import connectors
+import flex
 import guardrails
 import llm as llm_mod
 import mcp_client
@@ -528,6 +529,38 @@ def enrich_catalog(conn_id: str, payload: dict = Body(default={}),
         return envelope(db, {"enriched": enriched_count, "failed": failed})
 
 
+@app.put("/api/connections/{conn_id}/catalog")
+def update_catalog(conn_id: str, payload: dict = Body(...),
+                   x_base_version: str | None = Header(None, alias="X-Base-Version")):
+    """Manually edit & persist catalog documentation (table/column descriptions, PII).
+
+    Saved in db.json — no LLM call needed, and survives reloads/re-introspection.
+    """
+    with mutation(x_base_version) as db:
+        conn = get_conn_or_404(db, conn_id)
+        catalog = db["catalog"].get(conn_id)
+        if not catalog:
+            raise HTTPException(400, "Empty catalog — run the introspection first.")
+        table = next((t for t in catalog["tables"]
+                      if t["schema"] == payload.get("schema") and t["name"] == payload.get("table")), None)
+        if not table:
+            raise HTTPException(404, "Table not found in the catalog.")
+        if "description" in payload:
+            table["description"] = str(payload["description"])
+        col_by_name = {c["name"]: c for c in table["columns"]}
+        for patch in payload.get("columns", []):
+            col = col_by_name.get(patch.get("name"))
+            if not col:
+                continue
+            if "description" in patch:
+                col["description"] = str(patch["description"])
+            if "pii" in patch:
+                col["pii"] = bool(patch["pii"])
+        catalog["edited_at"] = storage.now_iso()
+        storage.audit(db, "catalog.edit", f"{conn['name']}: {table['schema']}.{table['name']} edited manually")
+        return envelope(db, {"ok": True})
+
+
 @app.post("/api/connections/{conn_id}/preview")
 def preview_table(conn_id: str, payload: dict = Body(...),
                   x_base_version: str | None = Header(None, alias="X-Base-Version")):
@@ -839,19 +872,37 @@ def magic_tool(payload: dict = Body(...),
                              "validation": validation, "test": test_outcome})
 
 
+def _table_columns(db: dict, conn_id: str, schema: str, table: str) -> list[str]:
+    cat = db["catalog"].get(conn_id) or {"tables": []}
+    hit = next((t for t in cat["tables"] if t["schema"] == schema and t["name"] == table), None)
+    return [c["name"] for c in (hit or {}).get("columns", [])]
+
+
+def _normalize_flex(db: dict, conn_id: str, raw: dict | None) -> dict:
+    spec = raw or {}
+    cols = _table_columns(db, conn_id, spec.get("schema", ""), spec.get("table", ""))
+    return flex.normalize(spec, cols or None)
+
+
 @app.post("/api/tools")
 def create_tool(payload: dict = Body(...),
                 x_base_version: str | None = Header(None, alias="X-Base-Version"),
                 x_workspace: str | None = Header(None, alias="X-Workspace")):
     with mutation(x_base_version) as db:
         conn = get_conn_or_404(db, payload.get("connection_id", ""))
-        sql = payload.get("sql", "")
-        validation = guardrails.validate(sql, connectors.dialect(conn["kind"]), guard_cfg(db))
-        if not validation["ok"]:
-            raise HTTPException(400, "SQL rejected by the guardrails: " + " ".join(validation["errors"]))
+        flex_spec = _normalize_flex(db, conn["id"], payload.get("flex"))
+        flexible = flex.is_active(flex_spec)
+        sql = "" if flexible else payload.get("sql", "")
+        if not flexible:
+            validation = guardrails.validate(sql, connectors.dialect(conn["kind"]), guard_cfg(db))
+            if not validation["ok"]:
+                raise HTTPException(400, "SQL rejected by the guardrails: " + " ".join(validation["errors"]))
         folder_id = payload.get("folder_id")
         if folder_id and not storage.find(db["folders"], folder_id):
             folder_id = None
+        guard = normalize_guardrails(payload.get("guardrails"), db["settings"]["guardrails"])
+        if flexible:
+            guard["max_rows"] = max(guard["max_rows"], flex_spec["max_limit"])
         tool = {
             "id": storage.new_id("tool"),
             "name": codegen.py_ident(payload.get("name") or "tool"),
@@ -859,9 +910,10 @@ def create_tool(payload: dict = Body(...),
             "connection_id": conn["id"],
             "query_id": payload.get("query_id"),
             "sql": sql,
-            "params": normalize_params(payload.get("params")),
-            "guardrails": normalize_guardrails(payload.get("guardrails"), db["settings"]["guardrails"]),
+            "params": flex.param_schema(flex_spec) if flexible else normalize_params(payload.get("params")),
+            "guardrails": guard,
             "row_policy": rls.normalize(payload.get("row_policy")),
+            "flex": flex_spec,
             "workspace_id": resolve_workspace(db, x_workspace),
             "folder_id": folder_id,
             "tags": [str(t) for t in (payload.get("tags") or [])],
@@ -869,14 +921,15 @@ def create_tool(payload: dict = Body(...),
             "security_review": payload.get("security_review"),
             "created_at": storage.now_iso(),
         }
-        sql_params = set(guardrails.extract_params(sql))
-        declared = {p["name"] for p in tool["params"]}
-        for missing in sorted(sql_params - declared):
-            tool["params"].append({"name": missing, "type": "string",
-                                   "description": "", "required": True, "default": None})
-        tool["params"] = [p for p in tool["params"] if p["name"] in sql_params]
+        if not flexible:
+            sql_params = set(guardrails.extract_params(sql))
+            declared = {p["name"] for p in tool["params"]}
+            for missing in sorted(sql_params - declared):
+                tool["params"].append({"name": missing, "type": "string",
+                                       "description": "", "required": True, "default": None})
+            tool["params"] = [p for p in tool["params"] if p["name"] in sql_params]
         db["tools"].insert(0, tool)
-        storage.audit(db, "tool.create", tool["name"])
+        storage.audit(db, "tool.create", tool["name"] + (" [flexible]" if flexible else ""))
         return envelope(db, {"id": tool["id"]})
 
 
@@ -887,13 +940,6 @@ def update_tool(tool_id: str, payload: dict = Body(...),
         tool = storage.find(db["tools"], tool_id)
         if not tool:
             raise HTTPException(404, "Tool not found.")
-        if "sql" in payload:
-            conn = get_conn_or_404(db, payload.get("connection_id") or tool["connection_id"])
-            validation = guardrails.validate(payload["sql"], connectors.dialect(conn["kind"]),
-                                             guard_cfg(db))
-            if not validation["ok"]:
-                raise HTTPException(400, "SQL rejected by the guardrails: " + " ".join(validation["errors"]))
-            tool["sql"] = payload["sql"]
         for key in ("description", "connection_id", "tags", "enabled", "security_review"):
             if key in payload:
                 tool[key] = payload[key]
@@ -902,12 +948,29 @@ def update_tool(tool_id: str, payload: dict = Body(...),
             tool["folder_id"] = fid if (fid and storage.find(db["folders"], fid)) else None
         if "name" in payload:
             tool["name"] = codegen.py_ident(payload["name"])
-        if "params" in payload:
-            tool["params"] = normalize_params(payload["params"])
         if "guardrails" in payload:
             tool["guardrails"] = normalize_guardrails(payload["guardrails"], db["settings"]["guardrails"])
         if "row_policy" in payload:
             tool["row_policy"] = rls.normalize(payload["row_policy"])
+
+        conn = get_conn_or_404(db, tool["connection_id"])
+        flex_spec = _normalize_flex(db, conn["id"], payload["flex"]) if "flex" in payload \
+            else tool.get("flex")
+        if flex.is_active(flex_spec):
+            tool["flex"] = flex_spec
+            tool["sql"] = ""
+            tool["params"] = flex.param_schema(flex_spec)
+            tool["guardrails"]["max_rows"] = max(tool["guardrails"]["max_rows"], flex_spec["max_limit"])
+        else:
+            tool["flex"] = flex.default_spec()
+            if "sql" in payload:
+                validation = guardrails.validate(payload["sql"], connectors.dialect(conn["kind"]),
+                                                 guard_cfg(db))
+                if not validation["ok"]:
+                    raise HTTPException(400, "SQL rejected by the guardrails: " + " ".join(validation["errors"]))
+                tool["sql"] = payload["sql"]
+            if "params" in payload:
+                tool["params"] = normalize_params(payload["params"])
         storage.audit(db, "tool.update", tool["name"])
         return envelope(db)
 
@@ -943,33 +1006,43 @@ def test_tool(tool_id: str, payload: dict = Body(default={}),
                 return envelope(db, {"ok": False,
                                      "error": f"Row-level security is on: provide the caller identity "
                                               f"“{policy.get('identity_arg', 'user_id')}”."})
-        coerced = {}
-        for param in tool["params"]:
-            value = args.get(param["name"], param.get("default"))
-            if value is None or value == "":
-                if param.get("required", True):
-                    return envelope(db, {"ok": False,
-                                         "error": f"Missing required parameter: {param['name']}"})
-                # Optional + omitted → bind SQL NULL, enabling dynamic filters such as
-                # WHERE (:param IS NULL OR column = :param).
-                coerced[param["name"]] = None
-                continue
-            try:
-                if param["type"] == "integer":
-                    value = int(value)
-                elif param["type"] == "number":
-                    value = float(value)
-                elif param["type"] == "boolean":
-                    value = str(value).lower() in ("true", "1", "yes")
-                else:
-                    value = str(value)
-            except (TypeError, ValueError):
-                return envelope(db, {"ok": False,
-                                     "error": f"Invalid value for {param['name']} ({param['type']})."})
-            coerced[param["name"]] = value
         cfg = guard_cfg(db, tool.get("guardrails"))
-        outcome = run_validated(db, conn, tool["sql"], coerced, cfg,
-                                policy=policy, identity_value=identity_value)
+        if flex.is_active(tool.get("flex")):
+            # Flexible tool: assemble the SQL from the agent's field/aggregate/filter choices.
+            flex_args = {p["name"]: args.get(p["name"], p.get("default")) for p in tool["params"]}
+            try:
+                built_sql, built_params = flex.build(tool["flex"], connectors.dialect(conn["kind"]), flex_args)
+            except ValueError as exc:
+                return envelope(db, {"ok": False, "error": str(exc)})
+            outcome = run_validated(db, conn, built_sql, built_params, cfg,
+                                    policy=policy, identity_value=identity_value)
+        else:
+            coerced = {}
+            for param in tool["params"]:
+                value = args.get(param["name"], param.get("default"))
+                if value is None or value == "":
+                    if param.get("required", True):
+                        return envelope(db, {"ok": False,
+                                             "error": f"Missing required parameter: {param['name']}"})
+                    # Optional + omitted → bind SQL NULL, enabling dynamic filters such as
+                    # WHERE (:param IS NULL OR column = :param).
+                    coerced[param["name"]] = None
+                    continue
+                try:
+                    if param["type"] == "integer":
+                        value = int(value)
+                    elif param["type"] == "number":
+                        value = float(value)
+                    elif param["type"] == "boolean":
+                        value = str(value).lower() in ("true", "1", "yes")
+                    else:
+                        value = str(value)
+                except (TypeError, ValueError):
+                    return envelope(db, {"ok": False,
+                                         "error": f"Invalid value for {param['name']} ({param['type']})."})
+                coerced[param["name"]] = value
+            outcome = run_validated(db, conn, tool["sql"], coerced, cfg,
+                                    policy=policy, identity_value=identity_value)
         if outcome["ok"]:
             masked = {m.lower() for m in tool["guardrails"].get("masked_columns", [])}
             if masked:

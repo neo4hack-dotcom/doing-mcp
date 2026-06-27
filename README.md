@@ -143,6 +143,22 @@ Settings → **Backup & restore**:
 - **Folders** group tools into customizable, color-tagged buckets (per workspace). Filter the
   tool list by folder, move a tool from its card, or assign it in the editor.
 
+## Editable data dictionary
+
+Catalog documentation is saved in `db.json` and survives reloads and re-introspection — the LLM
+only runs when you ask. In the Explorer you can **edit everything by hand**: the table description,
+each column's description, and the PII flag (one click). `PUT /api/connections/{id}/catalog` persists
+the edits; AI enrichment and manual edits coexist.
+
+## Flexible tools (fields / aggregates / filters at call time)
+
+Beyond fixed SQL and optional filters, a tool can be made **flexible**: at creation you whitelist a
+base table's **dimensions**, **metrics**, **aggregates** (count/sum/avg/min/max) and **filters**; at
+call time the agent chooses what to return — which fields, an optional `metric` + `aggregate`,
+equality filters, `order_by`/`order_dir` and `limit`. The server assembles the SQL from the whitelist
+only (identifiers validated, values bound) — **injection-proof**, no SQL to write. The same builder is
+compiled into the generated server, so one flexible tool replaces dozens of fixed variants.
+
 ## ClickHouse flexibility & versatile tools
 
 - **Dialect-aware guardrails**: ClickHouse power features pass through — CTEs (`WITH`),
